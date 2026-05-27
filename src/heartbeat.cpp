@@ -5,8 +5,9 @@
 // Pulse sensor input pin on the ESP32.
 static const int PulseWire = D3;
 
-// Threshold for the PulseSensor library to detect a beat.
-// This is tuned for the ESP32 12-bit ADC range (0-4095).
+// Beat detection threshold for the 12-bit ADC (range 0–4095).
+// Raise if you get false beats (noise). Lower if real beats are missed.
+// Start at 1930 and adjust in steps of 50 while watching serial output.
 static const int Threshold = 1930;
 
 // LED used by PulseSensorPlayground to blink on each beat.
@@ -25,10 +26,42 @@ static PulseSensorPlayground pulseSensor;
 static const unsigned long RAW_PRINT_INTERVAL_MS = 500;
 static unsigned long lastRawPrint = 0;
 
+// Rolling signal window for contact quality — checks how much the signal swings over ~800ms.
+// A floating/idle sensor sits flat; a real heartbeat produces visible variation.
+static const int CONTACT_WINDOW = 40;       // 40 samples × 20ms loop = 800ms
+static const int CONTACT_MIN_RANGE = 200;  // ADC counts of swing required to count as contact
+static int contactSamples[CONTACT_WINDOW];
+static int contactIdx = 0;
+static bool contactWindowFull = false;
+
 // Minimum and maximum accepted beat interval.
 // This prevents fast false beats from showing as high BPM.
 static const int MIN_ACCEPTABLE_IBI_MS = 500;   // 120 BPM max
 static const int MAX_ACCEPTABLE_IBI_MS = 1500;  // 40 BPM min
+
+// Rolling BPM average — requires this many consecutive valid beats before
+// reporting a stable BPM. Raise to be more conservative, lower to respond faster.
+static const int BPM_HISTORY_SIZE = 5;
+static int bpmHistory[BPM_HISTORY_SIZE] = {0};
+static int bpmHistoryIndex = 0;
+static int bpmHistoryCount = 0;
+
+// If no valid beat arrives within this window, reset the average (contact lost).
+static const unsigned long BPM_RESET_TIMEOUT_MS = 5000;
+static unsigned long lastValidBeatTime = 0;
+
+// Brightness decay after each beat — flash lasts this many ms then fades to 0.
+static const unsigned long BEAT_DECAY_MS = 600;
+static unsigned long lastBeatMs = 0;
+static uint8_t beatPeak = 0;
+
+// Exposed contact state for LED transitions.
+static bool lastContactGood = false;
+
+// How long to hold "contact good" after signal goes POOR — absorbs finger shifts.
+// Raise if transitions to purple feel too trigger-happy. Lower if you want faster response.
+static const unsigned long CONTACT_HOLD_MS = 2500;
+static unsigned long lastContactGoodTime = 0;
 
 void setupHeartbeat() {
     // Start serial output for debugging and monitoring.
@@ -37,6 +70,9 @@ void setupHeartbeat() {
 
     // Set ESP32 ADC resolution to 12 bits.
     analogReadResolution(12);
+
+    // Pre-fill contact window with midpoint so range starts at 0 (POOR) until real data arrives.
+    for (int i = 0; i < CONTACT_WINDOW; i++) contactSamples[i] = 2048;
 
     // Configure the pulse sensor input and blink LED behavior.
     pulseSensor.analogInput(PulseWire);
@@ -51,9 +87,25 @@ void setupHeartbeat() {
     }
 }
 
+bool getContactGood() {
+    return lastContactGood || (millis() - lastContactGoodTime < CONTACT_HOLD_MS);
+}
+// Returns the averaged BPM once enough consecutive valid beats are collected.
+// Returns 0 if still warming up or if contact has been lost.
+int getStableBPM() {
+    if (bpmHistoryCount < BPM_HISTORY_SIZE) return 0;
+    if (millis() - lastValidBeatTime > BPM_RESET_TIMEOUT_MS) {
+        bpmHistoryCount = 0;
+        return 0;
+    }
+    int sum = 0;
+    for (int i = 0; i < BPM_HISTORY_SIZE; i++) sum += bpmHistory[i];
+    return sum / BPM_HISTORY_SIZE;
+}
+
 uint8_t heartbeatBrightness() {
-    // Default pulse brightness when no heartbeat is detected.
-    uint8_t pulse = 180;
+    // Default: 0 lets main.cpp fall back to standby breathing glow.
+    uint8_t pulse = 0;
 
     // Get the current timestamp and raw sample for diagnostics.
     unsigned long now = millis();
@@ -66,8 +118,20 @@ uint8_t heartbeatBrightness() {
     int interBeatInterval = pulseSensor.getInterBeatIntervalMs();
     bool bpmReasonable = (interBeatInterval >= 428 && interBeatInterval <= 1500);
 
-    // Print raw sensor diagnostics periodically.
-    bool contactGood = (rawSample > 1200 && rawSample < 2900);
+    // Update rolling contact window and compute signal range.
+    contactSamples[contactIdx] = rawSample;
+    contactIdx = (contactIdx + 1) % CONTACT_WINDOW;
+    if (contactIdx == 0) contactWindowFull = true;
+
+    int cMin = contactSamples[0], cMax = contactSamples[0];
+    int windowSize = contactWindowFull ? CONTACT_WINDOW : contactIdx;
+    for (int i = 1; i < windowSize; i++) {
+        if (contactSamples[i] < cMin) cMin = contactSamples[i];
+        if (contactSamples[i] > cMax) cMax = contactSamples[i];
+    }
+    bool contactGood = (rawSample > 1200 && rawSample < 2900) && (cMax - cMin >= CONTACT_MIN_RANGE);
+    lastContactGood = contactGood;
+    if (contactGood) lastContactGoodTime = now;
 
     if (now - lastRawPrint >= RAW_PRINT_INTERVAL_MS) {
         Serial.print("CONTACT: ");
@@ -76,9 +140,9 @@ uint8_t heartbeatBrightness() {
         Serial.print(COLOR_RESET);
         Serial.print(" | RAW: ");
         Serial.print(rawSample);
-        Serial.print(" | IBI: ");
+        Serial.print(" | IBI: "); // Inter-beat interval
         Serial.print(interBeatInterval);
-        Serial.print(" ms");
+        Serial.print("ms");
         Serial.print(" | BPM: ");
         if (bpmReasonable) {
             Serial.print(myBPM);
@@ -89,22 +153,55 @@ uint8_t heartbeatBrightness() {
         lastRawPrint = now;
     }
 
-    // If the library signals the start of a beat, only accept it when the interval is reasonable.
-    if (justBeat) {
+    // Only consider the beat if the inter-beat interval is within a reasonable range.
+    if (justBeat) { 
         if (bpmReasonable) {
-            Serial.println("♥  A HeartBeat Happened !");
-            Serial.print("BPM: ");
-            Serial.println(myBPM);
-            pulse = beatsin8(30, 180, 255);
+            bpmHistory[bpmHistoryIndex] = myBPM; // Add to rolling BPM history for averaging
+            bpmHistoryIndex = (bpmHistoryIndex + 1) % BPM_HISTORY_SIZE; 
+            if (bpmHistoryCount < BPM_HISTORY_SIZE) bpmHistoryCount++; // Track how many valid beats we've seen for stable BPM calculation
+            lastValidBeatTime = now; // Update last valid beat time for BPM reset logic
+
+            int stable = getStableBPM(); // Get the current stable BPM average for diagnostics
+            // Beat detected — print in red for visibility
+            Serial.print(COLOR_RED); 
+            Serial.print("♥  Beat detected!");
+            Serial.print(COLOR_RESET);
+            Serial.print(" | RAW: "); // Diagnostics for raw signal on beat
+            Serial.print(rawSample);
+            Serial.print(" | BPM: ");
+            Serial.print(myBPM);
+            // If we have a stable BPM average, print it; otherwise indicate we're still warming up.
+            if (stable > 0) {
+                Serial.print(" | Stable: ");
+                Serial.print(stable);
+            }
+            // Still warming up — not enough valid beats for stable BPM average. 
+            else { 
+                Serial.print(" | Warming up (");
+                Serial.print(bpmHistoryCount);
+                Serial.print("/");
+                Serial.print(BPM_HISTORY_SIZE);
+                Serial.print(")");
+            }
+            Serial.println();
+            // Start the beat pulse at a bright value; it will decay in heartbeatBrightness() and applyHeartbeatPulse().
+            lastBeatMs = now;
+            // Start the beat pulse at a bright value; it will decay in heartbeatBrightness() and applyHeartbeatPulse().
+            beatPeak = 220; 
         } else {
-            Serial.println("⚠️  Beat ignored: interval out of range");
-            Serial.print("IBI: ");
+            Serial.print("⚠️  Beat ignored | IBI: ");
             Serial.print(interBeatInterval);
-            Serial.println(" ms");
+            Serial.println("ms");
         }
     }
 
-    return pulse;
+    // If a beat happened recently, return a decaying brightness flash.
+    unsigned long elapsed = now - lastBeatMs;
+    if (elapsed < BEAT_DECAY_MS) {
+        pulse = map(elapsed, 0, BEAT_DECAY_MS, beatPeak, 0);
+    }
+
+    return pulse; // Return the current pulse brightness for this frame; 0 if no beat or after decay.
 }
 
 void applyHeartbeatPulse(uint8_t pulse) {

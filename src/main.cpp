@@ -2,21 +2,22 @@
 #include "led_controller.h"
 #include "heartbeat.h"
 
-static uint8_t hueOffset = 0;
-
 void setup() {
+
+    // Initialize LED strip
     setupLedController();
+
+    // Initialize heartbeat sensor
     setupHeartbeat();
 }
 
+
 void loop() {
-    drawRainbow(hueOffset);
-
     uint8_t beat = heartbeatBrightness();
-    applyHeartbeatPulse(beat);
+    bool contact = getContactGood();
 
+    drawFrame(beat, contact);
     showLeds();
-
-    hueOffset += 4;
     delay(20);
 }
+
