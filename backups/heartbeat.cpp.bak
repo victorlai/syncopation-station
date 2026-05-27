@@ -1,0 +1,89 @@
+#include "heartbeat.h"
+#include <Arduino.h>
+
+#define PULSE_PIN D3
+
+// Signal level that counts as a heartbeat peak.
+// Lower = more sensitive
+// Higher = fewer false beats
+static const int threshold = 1930;
+
+// Signal must fall below this before another beat can trigger.
+// Helps prevent double-counting.
+static const int resetLevel = 1885;
+
+// Readings outside this range are likely:
+// - finger removed
+// - poor contact
+// - electrical noise
+static const int badLow = 1000;
+static const int badHigh = 3000;
+
+static bool beatDetected = false;
+static unsigned long lastBeatTime = 0;
+static unsigned long lastStatusPrint = 0;
+static unsigned long lastBeatPulseTime = 0;
+
+void setupHeartbeat() {
+    Serial.begin(115200);
+    delay(1000);
+
+    // ESP32 analog range: 0–4095
+    analogReadResolution(12);
+
+    Serial.println("Heartbeat monitor started...");
+}
+
+uint8_t heartbeatBrightness() {
+    int signal = analogRead(PULSE_PIN);
+    bool badReading = (signal < badLow || signal > badHigh);
+    unsigned long now = millis();
+
+    if (now - lastStatusPrint > 1000) {
+        if (badReading) {
+            Serial.print("🤏 Possible contact issue | Signal: ");
+            Serial.println(signal);
+        } else if (!beatDetected) {
+            Serial.print("Monitoring... | Signal: ");
+            Serial.println(signal);
+        }
+        lastStatusPrint = now;
+    }
+
+    if (badReading) {
+        beatDetected = false;
+        return 180;
+    }
+
+    if (signal > threshold && !beatDetected) {
+        beatDetected = true;
+
+        if (lastBeatTime > 0) {
+            unsigned long interval = now - lastBeatTime;
+            if (interval > 450 && interval < 1500) {
+                int bpm = 60000 / interval;
+                Serial.print("❤️ BEAT | Signal: ");
+                Serial.print(signal);
+                Serial.print(" | BPM: ");
+                Serial.println(bpm);
+            }
+        }
+
+        lastBeatTime = now;
+        lastBeatPulseTime = now;
+    }
+
+    if (signal < resetLevel) {
+        beatDetected = false;
+    }
+
+    if (now - lastBeatPulseTime < 300) {
+        return beatsin8(30, 180, 255);
+    }
+
+    return 180;
+}
+
+void applyHeartbeatPulse(uint8_t pulse) {
+    nscale8_video(leds, NUM_LEDS, pulse);
+}
