@@ -15,24 +15,30 @@ constexpr uint16_t NUM_LEDS = 20; // 60 in 1m strip. Use less for testing
 // 90–255 = very bright / high power draw
 constexpr uint8_t BRIGHTNESS = 100;
 
-// Maximum allowed current draw
-constexpr uint16_t MAX_MILLIAMPS = 500;
+// Maximum current draw — scales with strip length so FastLED doesn't silently dim a longer strip.
+// Formula: ~25 mA per LED (red channel at BRIGHTNESS ≈ 100 draws well under this).
+constexpr uint16_t MAX_MILLIAMPS = NUM_LEDS * 25;
 
-// Connecting animation — thermometer fill when stable BPM is first detected.
-constexpr uint32_t CONNECTING_FILL_MS     = 1500;  // ms to fill strip left→right
-constexpr uint32_t CONNECTING_HOLD_MS     = 500;   // ms to hold fully lit before pulsing
-constexpr uint8_t  CONNECTING_START_BEATS = 2;     // valid beats before animation begins (≤ BPM_HISTORY_SIZE)
+// Connecting animation constants.
+constexpr uint32_t CONNECTING_FILL_MS   = 2500;  // ms to fill strip from beat-count LEDs to full
+constexpr uint32_t CONNECTING_HOLD_MS   = 500;   // ms to hold fully lit before pulsing
+constexpr uint32_t DRAIN_MS             = 800;   // ms for right-to-left wipe when contact is lost
+// LEDs revealed per confirmed beat during gathering — ~1/6 of strip so 3 beats cover ~half,
+// leaving a satisfying "locked in" fill when stable BPM fires. Scales with strip length.
+constexpr uint8_t  GATHER_LEDS_PER_BEAT = NUM_LEDS / 6;
 
 // Shared LED array
 extern CRGB leds[NUM_LEDS];
 
 // LED controller functions
 void setupLedController();
-// contact    = finger detected (starts purple→black fade)
-// confirmed  = held long enough (enables animation)
-// connecting = enough beats gathered to start thermometer fill
-// beatPulse  = decaying brightness added to red on each confirmed beat (0 = no flash)
-// One write per frame — no second pass, eliminates sync artifacts.
-void drawFrame(bool contact, bool confirmed, bool connecting, uint8_t bpm, uint8_t beatPulse = 0);
+// possibleContact = raw near-zero detected (earliest touch hint, before contact quality check)
+// contact         = sustained signal quality (getContactGood)
+// confirmed       = held long enough to trust (isContactConfirmed)
+// beatCount       = valid beats gathered; drives fill level (0 → BPM_HISTORY_SIZE)
+// bpm             = stable BPM; non-zero when beatCount == BPM_HISTORY_SIZE
+// beatPulse       = decaying brightness on each confirmed beat
+void drawFrame(bool possibleContact, bool contact, bool confirmed,
+               int beatCount, uint8_t bpm, uint8_t beatPulse = 0);
 void showLeds();
 void clearLeds();

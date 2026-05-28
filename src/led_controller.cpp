@@ -4,145 +4,247 @@
 CRGB leds[NUM_LEDS];
 
 void setupLedController() {
-
-    // Initialize LED strip
     FastLED.addLeds<WS2812B, LED_PIN, GRB>(leds, NUM_LEDS);
-
-    // Limit total power draw
     FastLED.setMaxPowerInVoltsAndMilliamps(5, MAX_MILLIAMPS);
-
-    // Global brightness (0–255)
     FastLED.setBrightness(BRIGHTNESS);
-
-    // Start with LEDs off
     FastLED.clear();
     FastLED.show();
 }
 
-// Two-phase transition: purple fades to black first, then red fades in. Reverses on release.
-// This ensures we never jump directly between purple and red.
-static uint8_t bgLevel  = 255;  // 255 = full purple, 0 = black
-static uint8_t redLevel = 0;    // 0 = black, 255 = full red; used for idle-state fade-out only
+// ── State ─────────────────────────────────────────────────────────────────────
 
-// Thermometer fill animation phases.
-enum AnimPhase : uint8_t { PHASE_IDLE, PHASE_FILL, PHASE_HOLD, PHASE_PULSE };
+// Purple background level: 255 = full glow, 0 = black.
+static uint8_t bgLevel = 255;
+
+enum AnimPhase : uint8_t {
+    PHASE_IDLE,      // purple breathing — no contact
+    PHASE_POSSIBLE,  // 1 blinking LED — raw near-zero detected, awaiting confirmation
+    PHASE_GATHER,    // 1 LED per beat + big fill when stable BPM found
+    PHASE_HOLD,      // all LEDs solid — brief hold before pulsing
+    PHASE_PULSE,     // beat-locked heartbeat pulsing, degrades when beats stop
+    PHASE_DRAIN      // right-to-left wipe — contact lost during pulse/hold
+};
 static AnimPhase     animPhase        = PHASE_IDLE;
 static unsigned long animPhaseStartMs = 0;
 
-// Beat-locked pulse state — updated each time a beat fires in PHASE_PULSE.
-// Using smoothed IBI keeps the visual from jumping when BPM estimates shift.
+// GATHER: smooth float so LEDs ease in rather than snapping.
+static float smoothLitLEDs = 0.0f;
+
+// PULSE: beat-locked animation state.
 static uint8_t       prevBeatPulse = 0;
-static uint32_t      animPeriodMs  = 857;   // smoothed inter-beat interval, ~70 BPM
+static uint32_t      animPeriodMs  = 857;   // smoothed inter-beat interval (~70 BPM default)
 static unsigned long animBeatMs    = 0;
 
-void drawFrame(bool contact, bool confirmed, bool connecting, uint8_t bpm, uint8_t beatPulse) {
-    // ── State transitions ─────────────────────────────────────────────────────
-    if (!confirmed) {
-        // Reset animation on contact loss; leave redLevel intact so it fades out naturally.
-        animPhase        = PHASE_IDLE;
-        animPhaseStartMs = 0;
-        animBeatMs       = 0;
-        prevBeatPulse    = 0;
+// DRAIN: how many LEDs were lit when the drain started (can be <NUM_LEDS if degraded).
+static uint16_t drainLitAtStart = NUM_LEDS;
 
-        if (contact) {
-            // Contact detected but not yet confirmed — slowly dim purple over the confirmation window.
-            bgLevel = (bgLevel > 1) ? bgLevel - 1 : 0;
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+// Render `litCount` red LEDs with a gradient (dim at index 0, bright at leading edge).
+static void renderGatherLEDs(uint16_t litCount) {
+    for (uint16_t i = 0; i < NUM_LEDS; i++) {
+        if (i < litCount) {
+            uint8_t bright = (litCount > 1)
+                ? (uint8_t)map(i, 0, litCount - 1, 40, 180)
+                : 140;
+            if (i == litCount - 1) bright = 220; // leading-edge pop
+            leds[i] = CRGB(bright, 0, 0);
         } else {
-            // No contact: fade red out first, then bring purple back.
-            if (redLevel > 0)  redLevel = (redLevel > 4) ? redLevel - 4 : 0;
-            else               bgLevel  = (bgLevel  < 252) ? bgLevel  + 5 : 255;
+            leds[i] = CRGB::Black;
         }
-    } else {
-        // Confirmed: drain purple first.
-        if (bgLevel > 0) bgLevel = (bgLevel > 2) ? bgLevel - 2 : 0;
+    }
+}
 
-        unsigned long now = millis();
+// ── Main frame function ───────────────────────────────────────────────────────
 
-        // Rising edge: start fill once purple is gone and enough beats are gathered.
-        if (connecting && animPhase == PHASE_IDLE && bgLevel == 0) {
-            animPhase        = PHASE_FILL;
-            animPhaseStartMs = now;
-        }
+void drawFrame(bool possibleContact, bool contact, bool confirmed,
+               int beatCount, uint8_t bpm, uint8_t beatPulse) {
 
-        // Advance fill → hold → pulse.
-        if (animPhase == PHASE_FILL && now - animPhaseStartMs >= CONNECTING_FILL_MS) {
-            animPhase        = PHASE_HOLD;
-            animPhaseStartMs = now;
-        }
-        if (animPhase == PHASE_HOLD && now - animPhaseStartMs >= CONNECTING_HOLD_MS) {
-            animPhase   = PHASE_PULSE;
-            redLevel    = 255;   // restore so idle fade-out is smooth if contact is later lost
-            animBeatMs  = now;   // start at full brightness on entry
-        }
+    unsigned long now = millis();
+
+    // ── Smooth LED fill update ────────────────────────────────────────────────
+    // Target: 1 LED per beat while gathering; jumps to full strip when stable BPM found.
+    const float riseSpeed = (float)NUM_LEDS * 10.0f / CONNECTING_FILL_MS;
+    float targetLit = 0.0f;
+    if (animPhase == PHASE_GATHER || animPhase == PHASE_HOLD || animPhase == PHASE_PULSE) {
+        targetLit = (bpm > 0) ? (float)NUM_LEDS
+                              : min((float)NUM_LEDS, (float)beatCount * GATHER_LEDS_PER_BEAT);
+    }
+    if (smoothLitLEDs < targetLit) smoothLitLEDs = min(smoothLitLEDs + riseSpeed, targetLit);
+    else                           smoothLitLEDs = max(smoothLitLEDs - riseSpeed, targetLit);
+
+    // ── Beat detection — must happen before connectionLevel is computed ────────
+    // beatPulse spikes from ~0 to ~213 on each confirmed beat.
+    bool beatJustFired = (animPhase == PHASE_PULSE) && (beatPulse > 100) && (prevBeatPulse < 50);
+    prevBeatPulse = beatPulse;
+    if (beatJustFired && bpm > 0) {
+        animBeatMs = now;
+        uint32_t target = 60000UL / (uint32_t)bpm;
+        animPeriodMs = (animPeriodMs * 4 + target) / 5; // 80/20 EMA — drifts, never jumps
+    }
+
+    // ── Connection level (PULSE only) ─────────────────────────────────────────
+    // 1.0 = beats on time, decays toward 0.0 as beats become overdue.
+    // Starts degrading after 1.5× expected interval, fully degraded at 4× interval.
+    // On a beat, animBeatMs resets → connectionLevel snaps back to 1.0 immediately.
+    uint32_t timeSinceLastBeat = (uint32_t)(now - animBeatMs);
+    uint32_t degradeStartMs    = animPeriodMs + animPeriodMs / 2; // 1.5×
+    uint32_t degradeFullMs     = animPeriodMs * 4;                // 4×
+    float connectionLevel = 1.0f;
+    if (animPhase == PHASE_PULSE && timeSinceLastBeat > degradeStartMs) {
+        connectionLevel = (timeSinceLastBeat >= degradeFullMs) ? 0.0f
+            : 1.0f - (float)(timeSinceLastBeat - degradeStartMs)
+                    / (float)(degradeFullMs - degradeStartMs);
+    }
+
+    // ── Phase transitions ─────────────────────────────────────────────────────
+    switch (animPhase) {
+
+        case PHASE_IDLE:
+            if (possibleContact || contact) {
+                bgLevel = (bgLevel > 1) ? bgLevel - 1 : 0;
+            } else {
+                bgLevel = (bgLevel < 252) ? bgLevel + 5 : 255;
+            }
+            if (confirmed) {
+                animPhase     = PHASE_GATHER;
+                bgLevel       = 0;
+                smoothLitLEDs = 0.0f;
+            } else if (possibleContact) {
+                animPhase = PHASE_POSSIBLE;
+            }
+            break;
+
+        case PHASE_POSSIBLE:
+            if (bgLevel > 0) bgLevel = (bgLevel > 1) ? bgLevel - 1 : 0;
+            if (confirmed) {
+                animPhase     = PHASE_GATHER;
+                bgLevel       = 0;
+                smoothLitLEDs = 0.0f;
+            } else if (!possibleContact && !contact) {
+                animPhase = PHASE_IDLE;
+            }
+            break;
+
+        case PHASE_GATHER:
+            if (!confirmed && !contact && !possibleContact) {
+                animPhase = PHASE_IDLE;
+                bgLevel   = 0;
+            } else if (!confirmed && (contact || possibleContact)) {
+                animPhase = PHASE_POSSIBLE;
+                bgLevel   = 0;
+            } else if (bpm > 0 && smoothLitLEDs >= (float)NUM_LEDS - 0.5f) {
+                smoothLitLEDs    = (float)NUM_LEDS;
+                animPhase        = PHASE_HOLD;
+                animPhaseStartMs = now;
+            }
+            break;
+
+        case PHASE_HOLD:
+            if (!confirmed) {
+                drainLitAtStart  = NUM_LEDS;
+                animPhase        = PHASE_DRAIN;
+                animPhaseStartMs = now;
+            } else if (now - animPhaseStartMs >= CONNECTING_HOLD_MS) {
+                animPhase  = PHASE_PULSE;
+                animBeatMs = now; // start at full brightness
+            }
+            break;
+
+        case PHASE_PULSE:
+            if (!confirmed) {
+                // Drain from wherever degradation left the strip — not always full.
+                drainLitAtStart  = max((uint16_t)1,
+                                       (uint16_t)(connectionLevel * NUM_LEDS + 0.5f));
+                animPhase        = PHASE_DRAIN;
+                animPhaseStartMs = now;
+            } else if (bpm == 0) {
+                // BPM history expired (8 s without a beat) — drop back to gather.
+                // smoothLitLEDs picks up from current degraded position (min 1) so
+                // the rebuild animation runs naturally from that point.
+                smoothLitLEDs = max(1.0f, connectionLevel * (float)NUM_LEDS);
+                animPhase     = PHASE_GATHER;
+            }
+            break;
+
+        case PHASE_DRAIN:
+            if (confirmed) {
+                animPhase  = PHASE_PULSE;
+                animBeatMs = now;
+            } else if (now - animPhaseStartMs >= DRAIN_MS) {
+                animPhase     = PHASE_IDLE;
+                bgLevel       = 0;
+                smoothLitLEDs = 0.0f;
+                prevBeatPulse = 0;
+            }
+            break;
     }
 
     // ── Rendering ─────────────────────────────────────────────────────────────
-    if (animPhase == PHASE_FILL) {
-        unsigned long elapsed = millis() - animPhaseStartMs;
-        // Single-sensor: fill full strip. Two sensors: change fillTarget to NUM_LEDS / 2.
-        uint16_t fillTarget = NUM_LEDS;
-        uint16_t fillCount  = (uint16_t)((elapsed * fillTarget) / CONNECTING_FILL_MS);
-        if (fillCount > fillTarget) fillCount = fillTarget;
+    switch (animPhase) {
 
-        for (uint16_t i = 0; i < NUM_LEDS; i++) {
-            if (i < fillCount) {
-                // Linear gradient dim→bright across the filled portion; leading edge pops brightest.
-                uint8_t bright = (fillTarget > 1)
-                    ? (uint8_t)map(i, 0, fillTarget - 1, 40, 180)
-                    : 180;
-                if (i == fillCount - 1) bright = 220;
-                leds[i] = CRGB(bright, 0, 0);
-            } else {
-                leds[i] = CRGB::Black;
+        case PHASE_IDLE: {
+            // Low red scanner: 5-LED pulse bouncing back and forth, centre brightest.
+            uint8_t scanPos = beatsin8(30, 0, NUM_LEDS - 1);
+            fill_solid(leds, NUM_LEDS, CRGB::Black);
+            static const int8_t  off[5]   = { -2, -1,  0,  1,  2 };
+            static const uint8_t bri[5]   = {  12, 45, 110, 45, 12 };
+            for (uint8_t j = 0; j < 5; j++) {
+                int16_t idx = (int16_t)scanPos + off[j];
+                if (idx >= 0 && idx < (int16_t)NUM_LEDS)
+                    leds[idx] = CRGB(bri[j], 0, 0);
             }
-        }
-    } else if (animPhase == PHASE_HOLD) {
-        fill_solid(leds, NUM_LEDS, CRGB(200, 0, 0));
-
-    } else if (animPhase == PHASE_PULSE) {
-        // Beat-locked smooth pulsing.
-        // Detect beat rising edge: beatPulse jumps from ~0 to ~213 when a beat fires.
-        // beatsin8 is intentionally NOT used here — any BPM change shifts its phase
-        // instantly, causing visible stutter. This animation is locked to actual beats.
-        bool beatJustFired = (beatPulse > 100) && (prevBeatPulse < 50);
-        prevBeatPulse = beatPulse;
-
-        if (beatJustFired && bpm > 0) {
-            animBeatMs = millis();
-            uint32_t target = 60000UL / (uint32_t)bpm;
-            // 80/20 EMA — period drifts slowly toward actual IBI, never jumps.
-            animPeriodMs = (animPeriodMs * 4 + target) / 5;
+            break;
         }
 
-        uint32_t elapsed   = (uint32_t)(millis() - animBeatMs);
-        if (elapsed > animPeriodMs) elapsed = animPeriodMs;
-        uint32_t remaining = animPeriodMs - elapsed;
-        // Quadratic ease-out: bright at beat, smooth decay, ambient glow between beats.
-        uint8_t decay    = (uint8_t)((uint32_t)220 * remaining * remaining /
-                                      ((uint32_t)animPeriodMs * animPeriodMs));
-        uint8_t finalRed = qadd8(decay, 25);
-        fill_solid(leds, NUM_LEDS, CRGB(finalRed, 0, 0));
+        case PHASE_POSSIBLE: {
+            // Scanner stops; single blinking LED signals possible contact.
+            fill_solid(leds, NUM_LEDS, CRGB::Black);
+            leds[0] = ((now / 250) % 2) ? CRGB(200, 0, 0) : CRGB::Black;
+            break;
+        }
 
-    } else {
-        // PHASE_IDLE: bgLevel/redLevel driven (purple ↔ black ↔ fading-out red).
-        uint8_t pulseBPM     = (bpm > 0) ? bpm : 60;
-        uint8_t purpleBright = scale8(beatsin8(6, 5, 80), bgLevel);
-        uint8_t baseRed      = scale8(beatsin8(pulseBPM, 0, 220), redLevel);
-        uint8_t finalRed     = qadd8(baseRed, beatPulse);
-        if (redLevel > 0) {
-            fill_solid(leds, NUM_LEDS, CRGB(finalRed, 0, 0));
-        } else {
-            fill_solid(leds, NUM_LEDS, CHSV(200, 180, purpleBright));
+        case PHASE_GATHER:
+            renderGatherLEDs((uint16_t)smoothLitLEDs);
+            break;
+
+        case PHASE_HOLD:
+            fill_solid(leds, NUM_LEDS, CRGB(200, 0, 0));
+            break;
+
+        case PHASE_PULSE:
+            if (connectionLevel < 1.0f) {
+                // Degraded: strip shrinks from right as beats become overdue.
+                // Floor at 1 LED — always shows the user something is still alive.
+                // A beat firing snaps connectionLevel back to 1.0 immediately.
+                uint16_t litCount = max((uint16_t)1,
+                                        (uint16_t)(connectionLevel * NUM_LEDS + 0.5f));
+                renderGatherLEDs(litCount);
+            } else {
+                // Full pulsing: quadratic decay from beat peak to ambient glow.
+                uint32_t elapsed   = timeSinceLastBeat;
+                if (elapsed > animPeriodMs) elapsed = animPeriodMs;
+                uint32_t remaining = animPeriodMs - elapsed;
+                uint8_t decay    = (uint8_t)((uint32_t)220 * remaining * remaining /
+                                              ((uint32_t)animPeriodMs * animPeriodMs));
+                uint8_t finalRed = qadd8(decay, 25);
+                fill_solid(leds, NUM_LEDS, CRGB(finalRed, 0, 0));
+            }
+            break;
+
+        case PHASE_DRAIN: {
+            // Right-to-left wipe starting from drainLitAtStart (may be < NUM_LEDS if degraded).
+            uint32_t elapsed = (uint32_t)(now - animPhaseStartMs);
+            uint16_t litCount = (elapsed < DRAIN_MS)
+                ? (uint16_t)((uint32_t)drainLitAtStart * (DRAIN_MS - elapsed) / DRAIN_MS)
+                : 0;
+            for (uint16_t i = 0; i < NUM_LEDS; i++) {
+                leds[i] = (i < litCount) ? CRGB(180, 0, 0) : CRGB::Black;
+            }
+            break;
         }
     }
 }
 
-// Send data to LEDs
-void showLeds() {
-    FastLED.show();
-}
-
-// Clear LED buffer
-void clearLeds() {
-    FastLED.clear();
-}
+void showLeds() { FastLED.show(); }
+void clearLeds() { FastLED.clear(); }

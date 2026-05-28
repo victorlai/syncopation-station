@@ -64,6 +64,11 @@ static bool lastContactGood = false;
 // Set true for one frame when a valid beat is confirmed. Read via getJustBeat().
 static bool justBeatFlag = false;
 
+// Possible-contact hint — fires on 2nd consecutive near-zero raw sample to avoid transients.
+static int           rawNearZeroStreak      = 0;
+static bool          possibleContactActive  = false;
+static unsigned long possibleContactUntilMs = 0;
+
 // How long to hold "contact good" after signal goes POOR — absorbs finger shifts.
 // Raise if transitions to purple feel too trigger-happy. Lower if you want faster response.
 static const unsigned long CONTACT_HOLD_MS = 2500;
@@ -248,6 +253,8 @@ bool isContactConfirmed() {
 
 int getValidBeatCount() { return bpmHistoryCount; }
 
+bool isPossibleContact() { return possibleContactActive; }
+
 // Returns true exactly once per valid beat, then resets. Use to trigger pulse spawning.
 bool getJustBeat() {
     bool result = justBeatFlag;
@@ -275,16 +282,21 @@ uint8_t heartbeatBrightness() {
     unsigned long now = millis();
     int rawSample = pulseSensor.getLatestSample();
 
-    // First-touch signature: the ADC briefly reads near-zero when a finger first makes contact.
-    // Print once on the falling edge so the user knows the sensor registered the touch.
-    static bool prevRawNearZero = false;
+    // First-touch signature: ADC reads near-zero when finger first makes contact.
+    // Require 2 consecutive samples to ignore single-sample transients.
     bool rawNearZero = (rawSample < 50);
-    if (rawNearZero && !prevRawNearZero) {
-        Serial.print(COLOR_ORANGE);
-        Serial.println("👆🏼 Possible contact detected... reading values");
-        Serial.print(COLOR_RESET);
+    if (rawNearZero) {
+        rawNearZeroStreak++;
+        if (rawNearZeroStreak == 2) {
+            possibleContactActive  = true;
+            possibleContactUntilMs = now + 4000; // hold 4s — covers CONTACT_CONFIRM_MS + buffer
+            Serial.print(COLOR_ORANGE);
+            Serial.println("👆🏼 Possible contact detected... reading values");
+            Serial.print(COLOR_RESET);
+        }
+    } else {
+        rawNearZeroStreak = 0;
     }
-    prevRawNearZero = rawNearZero;
 
     // Heartbeat state values from the PulseSensor library.
     bool justBeat = pulseSensor.sawStartOfBeat();
@@ -405,6 +417,11 @@ prevContactGood = contactGood;
     // Keeping it alive through brief signal dips prevents heartbeatActive from flickering.
     if (!getContactGood()) {
         bpmHistoryCount = 0;
+    }
+
+    // Expire possible-contact hint once the hold window passes with no confirmed contact.
+    if (possibleContactActive && now > possibleContactUntilMs && !getContactGood()) {
+        possibleContactActive = false;
     }
 
     // Quadratic ease-out decay: drops fast then tapers — more like a real heartbeat pulse.
