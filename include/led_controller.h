@@ -18,15 +18,21 @@ constexpr uint8_t BRIGHTNESS = 100;
 // Maximum allowed current draw
 constexpr uint16_t MAX_MILLIAMPS = 500;
 
+// Connecting animation — thermometer fill when stable BPM is first detected.
+constexpr uint32_t CONNECTING_FILL_MS     = 1500;  // ms to fill strip left→right
+constexpr uint32_t CONNECTING_HOLD_MS     = 500;   // ms to hold fully lit before pulsing
+constexpr uint8_t  CONNECTING_START_BEATS = 2;     // valid beats before animation begins (≤ BPM_HISTORY_SIZE)
+
 // Shared LED array
 extern CRGB leds[NUM_LEDS];
 
 // LED controller functions
 void setupLedController();
-// contact  = finger detected (starts fast purple→black fade immediately)
-// confirmed = held long enough (starts red fade in, enables pulses)
-// beatPulse: decaying brightness added to red on each confirmed beat (0 = no flash).
-// Merged here so every LED gets exactly one write per frame — eliminates sync artifacts.
-void drawFrame(bool contact, bool confirmed, uint8_t bpm, uint8_t beatPulse = 0);
+// contact    = finger detected (starts purple→black fade)
+// confirmed  = held long enough (enables animation)
+// connecting = enough beats gathered to start thermometer fill
+// beatPulse  = decaying brightness added to red on each confirmed beat (0 = no flash)
+// One write per frame — no second pass, eliminates sync artifacts.
+void drawFrame(bool contact, bool confirmed, bool connecting, uint8_t bpm, uint8_t beatPulse = 0);
 void showLeds();
 void clearLeds();

@@ -21,8 +21,11 @@ void loop() {
 
     // Red state and beat flash only activate once a real stable BPM is detected.
     // Prevents boot red flash and red persisting when the sensor has no real heartbeat signal.
-    // Visual flow: purple (idle) → dark (finger on, gathering beats) → red (heartbeat confirmed).
+    // Visual flow: purple (idle) → dark (finger on, gathering beats) → thermometer fill → pulsing red.
     bool heartbeatActive = confirmed && (bpm > 0);
+
+    // Thermometer fill starts once enough beats are gathered (before stable BPM is required).
+    bool connecting = confirmed && (getValidBeatCount() >= CONNECTING_START_BEATS);
 
     // Sync timing — tracks how long both participants have held confirmed contact simultaneously.
     // When Person B is added: updateSyncState(confirmed, confirmedB);
@@ -31,7 +34,7 @@ void loop() {
     updatePulses();
     // Beat pulse merged into drawFrame so every LED gets one write — eliminates flicker.
     uint8_t beatPulse = (heartbeatActive && pulse > 0) ? pulse : 0;
-    drawFrame(contact, heartbeatActive, bpm, beatPulse);
+    drawFrame(contact, confirmed, connecting, bpm, beatPulse);
 
     // Connection pulse (traveling blob) reserved for two-sensor mode.
     // Person B: if (getJustBeat() && confirmed) spawnPulse(LEFT_TO_RIGHT, 220);

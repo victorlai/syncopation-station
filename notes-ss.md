@@ -4,12 +4,16 @@ https://github.com/WorldFamousElectronics/PulseSensorPlayground/tree/master/exam
 
 # To Do
 
+Add an indicator to train user to press the right way.
+
 Create box with finger cutout
 
-Add ⬆︎⬇︎arrows showing the average going up or down to the right of the red line shwoing the stable bpm so it's easier to debug.
+# Tuning
 
-1. The Idle state is still never showing (purple)
-2. The lights are still flicking at different rates. Right now only 1 HB sensor is connected so lights should all be synced, is that the problem?
+CONNECTING_FILL_MS = 1500 — total fill duration
+CONNECTING_HOLD_MS = 500 — hold before pulsing
+CONNECTING_START_BEATS = 2 — beats needed to trigger (must be ≤ BPM_HISTORY_SIZE)
+
 
 # Startup 
 git pull

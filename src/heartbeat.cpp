@@ -216,7 +216,7 @@ void setupHeartbeat() {
 
     // Configure the pulse sensor input and blink LED behavior.
     pulseSensor.analogInput(PulseWire);
-    pulseSensor.blinkOnPulse(PulseLed);
+    // pulseSensor.blinkOnPulse(PulseLed); // disabled — timer ISR toggling a pin can cause marginal WS2812B signal corruption
     pulseSensor.setThreshold(Threshold);
 
     // Initialize the library and confirm startup.
@@ -245,6 +245,8 @@ bool isContactConfirmed() {
 
     return millis() - contactStartMs >= CONTACT_CONFIRM_MS;
 }
+
+int getValidBeatCount() { return bpmHistoryCount; }
 
 // Returns true exactly once per valid beat, then resets. Use to trigger pulse spawning.
 bool getJustBeat() {
@@ -371,29 +373,22 @@ prevContactGood = contactGood;
             lastValidBeatTime = now;
             justBeatFlag = true;
 
-            int stable = getStableBPM(); // Get the current stable BPM average for diagnostics
+            int stable = getStableBPM();
+            static int prevStableBpm = 0;
             Serial.print(COLOR_RED);
-            Serial.print("♥  Beat detected!");
-            Serial.print(" | RAW: ");
-            Serial.print(rawSample);
-            Serial.print(" | BPM: ");
-            Serial.print(myBPM);
+            Serial.printf("♥  Beat detected! | RAW: %4d | BPM: %3d", rawSample, myBPM);
             if (stable > 0) {
-                Serial.print(" | ♥ Stable BPM: ");
-                Serial.print(stable);
+                Serial.printf(" | ♥ Stable BPM: %3d", stable);
+                if      (prevStableBpm > 0 && stable > prevStableBpm) Serial.print(" ⬆");
+                else if (prevStableBpm > 0 && stable < prevStableBpm) Serial.print(" ⬇");
+                prevStableBpm = stable;
             } else {
-                Serial.print(" | Gathering beats (");
-                Serial.print(bpmHistoryCount);
-                Serial.print("/");
-                Serial.print(BPM_HISTORY_SIZE);
-                Serial.print(")");
+                Serial.printf(" | Gathering beats (%d/%d)", bpmHistoryCount, BPM_HISTORY_SIZE);
             }
             Serial.print(COLOR_RESET);
             Serial.println();
-            // Start the beat pulse at a bright value; it will decay in heartbeatBrightness() and applyHeartbeatPulse().
             lastBeatMs = now;
-            // Start the beat pulse at a bright value; it will decay in heartbeatBrightness() and applyHeartbeatPulse().
-            beatPeak = 220; 
+            beatPeak = 220;
         } else {
             Serial.print("⚠️  Beat ignored | IBI: ");
             Serial.print(interBeatInterval);
