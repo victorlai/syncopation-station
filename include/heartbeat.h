@@ -23,3 +23,7 @@ bool isContactConfirmed();
 
 // Returns true once per valid beat, then resets — use to trigger pulse spawning
 bool getJustBeat();
+
+// Interactive calibration routine — call from setup() or trigger via 'c' in serial monitor.
+// Samples no-finger noise floor then 3 with-finger rounds, prints recommended CONTACT_MIN_RANGE.
+void runCalibration();

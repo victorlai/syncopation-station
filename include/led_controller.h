@@ -25,6 +25,8 @@ extern CRGB leds[NUM_LEDS];
 void setupLedController();
 // contact  = finger detected (starts fast purple→black fade immediately)
 // confirmed = held long enough (starts red fade in, enables pulses)
-void drawFrame(bool contact, bool confirmed, uint8_t bpm);
+// beatPulse: decaying brightness added to red on each confirmed beat (0 = no flash).
+// Merged here so every LED gets exactly one write per frame — eliminates sync artifacts.
+void drawFrame(bool contact, bool confirmed, uint8_t bpm, uint8_t beatPulse = 0);
 void showLeds();
 void clearLeds();

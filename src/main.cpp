@@ -10,6 +10,9 @@ void setup() {
 }
 
 void loop() {
+    // Press 'c' in the serial monitor to run contact calibration at any time.
+    if (Serial.available() && Serial.read() == 'c') runCalibration();
+
     // Returns a decaying brightness value (220→0 over BEAT_DECAY_MS) on each confirmed beat.
     uint8_t pulse = heartbeatBrightness();
     bool contact   = getContactGood();
@@ -26,13 +29,9 @@ void loop() {
     updateSyncState(confirmed, false);
 
     updatePulses();
-    drawFrame(contact, heartbeatActive, bpm);
-
-    // Uniform beat flash across the full strip (single-sensor mode).
-    // When Person B is wired, limit to leds[0..NUM_LEDS/2 - 1] for Person A only.
-    if (heartbeatActive && pulse > 0) {
-        for (uint16_t i = 0; i < NUM_LEDS; i++) leds[i] += CRGB(pulse, 0, 0);
-    }
+    // Beat pulse merged into drawFrame so every LED gets one write — eliminates flicker.
+    uint8_t beatPulse = (heartbeatActive && pulse > 0) ? pulse : 0;
+    drawFrame(contact, heartbeatActive, bpm, beatPulse);
 
     // Connection pulse (traveling blob) reserved for two-sensor mode.
     // Person B: if (getJustBeat() && confirmed) spawnPulse(LEFT_TO_RIGHT, 220);

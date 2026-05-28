@@ -24,7 +24,7 @@ void setupLedController() {
 static uint8_t bgLevel  = 255;  // 255 = full purple, 0 = black
 static uint8_t redLevel = 0;    // 0 = black, 255 = full red
 
-void drawFrame(bool contact, bool confirmed, uint8_t bpm) {
+void drawFrame(bool contact, bool confirmed, uint8_t bpm, uint8_t beatPulse) {
     if (confirmed) {
         // Confirmed: finish fading purple out, then fade red in.
         if (bgLevel > 0)   bgLevel  = (bgLevel  > 2) ? bgLevel  - 2 : 0;
@@ -40,19 +40,19 @@ void drawFrame(bool contact, bool confirmed, uint8_t bpm) {
         else               bgLevel  = (bgLevel  < 252) ? bgLevel  + 5 : 255;
     }
 
-    // Compute colours once per frame, not per LED.
-    uint8_t purpleBrightness = scale8(beatsin8(6, 5, 80), bgLevel);
-    uint8_t pulseBPM         = (bpm > 0) ? bpm : 60;
-    uint8_t redBrightness    = scale8(beatsin8(pulseBPM, 0, 220), redLevel);
+    // Compute final colours once — fill_solid writes every LED identically in one pass.
+    // beatPulse is merged here so there is no second write loop in main.cpp.
+    uint8_t pulseBPM      = (bpm > 0) ? bpm : 60;
+    uint8_t purpleBright  = scale8(beatsin8(6, 5, 80), bgLevel);
+    uint8_t baseRed       = scale8(beatsin8(pulseBPM, 0, 220), redLevel);
+    uint8_t finalRed      = qadd8(baseRed, beatPulse);
 
     // Single-sensor mode: full strip follows Person A.
-    // When Person B is wired, restore: if (confirmed && i >= NUM_LEDS / 2) leds[i] = CRGB::Black;
-    for (uint16_t i = 0; i < NUM_LEDS; ++i) {
-        if (redLevel > 0) {
-            leds[i] = CRGB(redBrightness, 0, 0);
-        } else {
-            leds[i] = CHSV(200, 180, purpleBrightness);
-        }
+    // When Person B is wired, restore the strip split here.
+    if (redLevel > 0) {
+        fill_solid(leds, NUM_LEDS, CRGB(finalRed, 0, 0));
+    } else {
+        fill_solid(leds, NUM_LEDS, CHSV(200, 180, purpleBright));
     }
 }
 
