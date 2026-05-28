@@ -14,10 +14,11 @@ static const int Threshold = 1930;
 static const int PulseLed = LED_BUILTIN;
 
 // ANSI color codes for serial monitor output.
-static const char* COLOR_RESET = "\x1b[0m";
-static const char* COLOR_RED = "\x1b[31m";
-static const char* COLOR_GREEN = "\x1b[32m";
+static const char* COLOR_RESET  = "\x1b[0m";
+static const char* COLOR_RED    = "\x1b[31m";
+static const char* COLOR_GREEN  = "\x1b[32m";
 static const char* COLOR_YELLOW = "\x1b[33m";
+static const char* COLOR_ORANGE = "\x1b[38;5;208m";
 
 // Library object used to interact with PulseSensorPlayground.
 static PulseSensorPlayground pulseSensor;
@@ -26,10 +27,10 @@ static PulseSensorPlayground pulseSensor;
 static const unsigned long RAW_PRINT_INTERVAL_MS = 500;
 static unsigned long lastRawPrint = 0;
 
-// Rolling signal window for contact quality — checks how much the signal swings over ~800ms.
+// Rolling signal window for contact quality — checks how much the signal swings over ~400ms.
 // A floating/idle sensor sits flat; a real heartbeat produces visible variation.
-static const int CONTACT_WINDOW = 40;       // 40 samples × 20ms loop = 800ms
-static const int CONTACT_MIN_RANGE = 200;  // ADC counts of swing required to count as contact
+static const int CONTACT_WINDOW = 40;       // 40 samples × 10ms loop = 400ms
+static const int CONTACT_MIN_RANGE = 60;   // ADC counts of swing required to count as contact. Raise if false GOOD in bright/noisy rooms. Lower if real beats are missed.
 static int contactSamples[CONTACT_WINDOW];
 static int contactIdx = 0;
 static bool contactWindowFull = false;
@@ -41,13 +42,13 @@ static const int MAX_ACCEPTABLE_IBI_MS = 1500;  // 40 BPM min
 
 // Rolling BPM average — requires this many consecutive valid beats before
 // reporting a stable BPM. Raise to be more conservative, lower to respond faster.
-static const int BPM_HISTORY_SIZE = 6;  // Number of valid beats to average for stable BPM reading. Adjust to taste. 5 is a good balance for responsiveness while filtering outliers. 10 can be for live.
+static const int BPM_HISTORY_SIZE = 4;   // Valid beats needed before reporting stable BPM. Lower = faster response, higher = more stable.
 static int bpmHistory[BPM_HISTORY_SIZE] = {0};
 static int bpmHistoryIndex = 0;
 static int bpmHistoryCount = 0;
 
 // If no valid beat arrives within this window, reset the average (contact lost).
-static const unsigned long BPM_RESET_TIMEOUT_MS = 5000;
+static const unsigned long BPM_RESET_TIMEOUT_MS = 8000;
 static unsigned long lastValidBeatTime = 0;
 
 // Brightness decay after each beat — flash lasts this many ms then fades to 0.
@@ -72,6 +73,149 @@ static const unsigned long CONTACT_CONFIRM_MS = 2000;
 static unsigned long contactStartMs = 0;
 static bool prevContactGood = false;
 
+// Calibration routine — call from setupHeartbeat() to find the right CONTACT_MIN_RANGE for your environment.
+// Phase 1: samples the idle (no-finger) signal to get the noise floor.
+// Phase 2: samples with your finger pressed to get the heartbeat signal swing.
+// Prints a recommended CONTACT_MIN_RANGE value based on both phases.
+static void runCalibration() {
+    Serial.println();
+    Serial.println("=== CONTACT CALIBRATION ===");
+    Serial.println("This will help you find the right CONTACT_MIN_RANGE for your environment.");
+    Serial.println();
+
+    const int SAMPLE_INTERVAL_MS  = 10;
+    const int COUNTDOWN_STEPS     = 3;
+    const int SAMPLE_DURATION_MS  = 6000;
+    const int PRINT_INTERVAL_MS   = 500;
+
+    // --- Phase 1: no finger ---
+    Serial.println("PHASE 1: Keep your finger OFF the sensor.");
+    for (int i = COUNTDOWN_STEPS; i >= 1; i--) {
+        Serial.print("Starting in ");
+        Serial.print(i);
+        Serial.println("...");
+        delay(1000);
+    }
+    Serial.println("Sampling no-finger state... (6 seconds)");
+
+    // Pre-fill contact window with current idle values.
+    static int calSamples[CONTACT_WINDOW];
+    for (int i = 0; i < CONTACT_WINDOW; i++) {
+        calSamples[i] = analogRead(PulseWire);
+        delay(SAMPLE_INTERVAL_MS);
+    }
+
+    int noFingerMaxRange = 0;
+    int noFingerRawMin   = 4095;
+    int noFingerRawMax   = 0;
+    unsigned long phaseEnd    = millis() + SAMPLE_DURATION_MS;
+    unsigned long nextPrint   = millis();
+    int calIdx                = 0;
+
+    while (millis() < phaseEnd) {
+        int raw = analogRead(PulseWire);
+        calSamples[calIdx] = raw;
+        calIdx = (calIdx + 1) % CONTACT_WINDOW;
+
+        int cMin = calSamples[0], cMax = calSamples[0];
+        for (int i = 1; i < CONTACT_WINDOW; i++) {
+            if (calSamples[i] < cMin) cMin = calSamples[i];
+            if (calSamples[i] > cMax) cMax = calSamples[i];
+        }
+        int range = cMax - cMin;
+        if (range > noFingerMaxRange) noFingerMaxRange = range;
+        if (raw < noFingerRawMin) noFingerRawMin = raw;
+        if (raw > noFingerRawMax) noFingerRawMax = raw;
+
+        if (millis() >= nextPrint) {
+            Serial.print("  RAW: ");
+            Serial.print(raw);
+            Serial.print(" | RANGE: ");
+            Serial.println(range);
+            nextPrint += PRINT_INTERVAL_MS;
+        }
+        delay(SAMPLE_INTERVAL_MS);
+    }
+
+    Serial.println();
+    Serial.print("No-finger max RANGE: ");
+    Serial.println(noFingerMaxRange);
+    Serial.println();
+
+    // --- Phase 2: with finger ---
+    Serial.println("PHASE 2: Place your finger firmly on the sensor.");
+    for (int i = COUNTDOWN_STEPS; i >= 1; i--) {
+        Serial.print("Starting in ");
+        Serial.print(i);
+        Serial.println("...");
+        delay(1000);
+    }
+    Serial.println("Sampling with-finger state... (6 seconds)");
+
+    for (int i = 0; i < CONTACT_WINDOW; i++) {
+        calSamples[i] = analogRead(PulseWire);
+        delay(SAMPLE_INTERVAL_MS);
+    }
+
+    int fingerMinRange  = 4095;
+    int fingerMaxRange  = 0;
+    phaseEnd  = millis() + SAMPLE_DURATION_MS;
+    nextPrint = millis();
+    calIdx    = 0;
+
+    while (millis() < phaseEnd) {
+        int raw = analogRead(PulseWire);
+        calSamples[calIdx] = raw;
+        calIdx = (calIdx + 1) % CONTACT_WINDOW;
+
+        int cMin = calSamples[0], cMax = calSamples[0];
+        for (int i = 1; i < CONTACT_WINDOW; i++) {
+            if (calSamples[i] < cMin) cMin = calSamples[i];
+            if (calSamples[i] > cMax) cMax = calSamples[i];
+        }
+        int range = cMax - cMin;
+        if (range < fingerMinRange) fingerMinRange = range;
+        if (range > fingerMaxRange) fingerMaxRange = range;
+
+        if (millis() >= nextPrint) {
+            Serial.print("  RAW: ");
+            Serial.print(raw);
+            Serial.print(" | RANGE: ");
+            Serial.println(range);
+            nextPrint += PRINT_INTERVAL_MS;
+        }
+        delay(SAMPLE_INTERVAL_MS);
+    }
+
+    Serial.println();
+    Serial.print("With-finger RANGE: ");
+    Serial.print(fingerMinRange);
+    Serial.print(" – ");
+    Serial.println(fingerMaxRange);
+    Serial.println();
+
+    // Recommend a threshold halfway between the two populations.
+    int recommended = (noFingerMaxRange + fingerMinRange) / 2;
+
+    Serial.println("=== CALIBRATION RESULT ===");
+    Serial.print("Noise floor (no finger): RANGE <= ");
+    Serial.println(noFingerMaxRange);
+    Serial.print("Signal floor (finger):   RANGE >= ");
+    Serial.println(fingerMinRange);
+    if (fingerMinRange > noFingerMaxRange) {
+        Serial.print("Recommended CONTACT_MIN_RANGE = ");
+        Serial.println(recommended);
+        Serial.println("Update the constant in heartbeat.cpp and recompile.");
+    } else {
+        Serial.println("WARNING: finger and no-finger ranges overlap — signal is weak.");
+        Serial.println("Try pressing the sensor more firmly, or reduce ambient light.");
+        Serial.print("Current CONTACT_MIN_RANGE = ");
+        Serial.println(CONTACT_MIN_RANGE);
+    }
+    Serial.println("==========================");
+    Serial.println();
+}
+
 void setupHeartbeat() {
     // Start serial output for debugging and monitoring.
     Serial.begin(115200);
@@ -94,10 +238,14 @@ void setupHeartbeat() {
     } else {
         Serial.println("PulseSensor failed to start.");
     }
+
+    // Uncomment to run the contact calibration routine on next boot.
+    // Open the serial monitor, then follow the prompts to find your CONTACT_MIN_RANGE.
+    // runCalibration();
 }
 
 bool getContactGood() {
-    return lastContactGood || (millis() - lastContactGoodTime < CONTACT_HOLD_MS);
+    return lastContactGood || (lastContactGoodTime != 0 && millis() - lastContactGoodTime < CONTACT_HOLD_MS);
 }
 
 // True only after contact has been held continuously for CONTACT_CONFIRM_MS.
@@ -139,6 +287,17 @@ uint8_t heartbeatBrightness() {
     unsigned long now = millis();
     int rawSample = pulseSensor.getLatestSample();
 
+    // First-touch signature: the ADC briefly reads near-zero when a finger first makes contact.
+    // Print once on the falling edge so the user knows the sensor registered the touch.
+    static bool prevRawNearZero = false;
+    bool rawNearZero = (rawSample < 50);
+    if (rawNearZero && !prevRawNearZero) {
+        Serial.print(COLOR_ORANGE);
+        Serial.println("👆🏼 Possible contact detected... reading values");
+        Serial.print(COLOR_RESET);
+    }
+    prevRawNearZero = rawNearZero;
+
     // Heartbeat state values from the PulseSensor library.
     bool justBeat = pulseSensor.sawStartOfBeat();
     bool insideBeat = pulseSensor.isInsideBeat();
@@ -157,8 +316,14 @@ uint8_t heartbeatBrightness() {
         if (contactSamples[i] < cMin) cMin = contactSamples[i];
         if (contactSamples[i] > cMax) cMax = contactSamples[i];
     }
-    bool contactGood = (rawSample > 1200 && rawSample < 2900) && (cMax - cMin >= CONTACT_MIN_RANGE);
-    
+    bool contactGood = (rawSample > 400 && rawSample < 3700) && (cMax - cMin >= CONTACT_MIN_RANGE);
+
+    // Suppress contact for the first 1.5s of loop execution — sensor needs time to settle after power-on.
+    // Without this, startup transients can set contactStartMs and trigger a false confirmation 2s later.
+    static unsigned long startupProtectUntil = 0;
+    if (startupProtectUntil == 0) startupProtectUntil = now + 2500;
+    if (now < startupProtectUntil) contactGood = false;
+
     // Start the confirmation timer only on a genuine rising edge — when contact was fully absent.
     // The contactStartMs == 0 guard prevents brief signal dips (which happen naturally between
     // heartbeat peaks) from restarting the timer. The hold timer handles those micro-drops.
@@ -181,13 +346,29 @@ prevContactGood = contactGood;
         Serial.print(contactGood ? COLOR_GREEN : COLOR_RED);
         Serial.print(contactGood ? "GOOD" : "POOR");
         Serial.print(COLOR_RESET);
+        // Show hold timer countdown when raw signal is POOR but hold is keeping contact alive.
+        // If you see this when NOT touching, purple can't return — raise CONTACT_MIN_RANGE.
+        bool holdActive = !contactGood && lastContactGoodTime != 0
+                          && (now - lastContactGoodTime) < CONTACT_HOLD_MS;
+        if (holdActive) {
+            unsigned long remaining = CONTACT_HOLD_MS - (now - lastContactGoodTime);
+            Serial.print(COLOR_YELLOW);
+            Serial.print(" (hold ");
+            Serial.print(remaining / 1000UL);
+            Serial.print(".");
+            Serial.print((remaining % 1000) / 100);
+            Serial.print("s)");
+            Serial.print(COLOR_RESET);
+        }
         Serial.print(" | RAW: ");
         Serial.print(rawSample);
-        Serial.print(" | IBI: "); // Inter-beat interval
+        Serial.print(" | RANGE: ");
+        Serial.print(cMax - cMin);
+        Serial.print(" | IBI: ");
         Serial.print(interBeatInterval);
         Serial.print("ms");
         Serial.print(" | BPM: ");
-        if (bpmReasonable) {
+        if (bpmReasonable && myBPM > 0) {
             Serial.print(myBPM);
         } else {
             Serial.print("---");
@@ -196,7 +377,7 @@ prevContactGood = contactGood;
         lastRawPrint = now;
     }
 
-    // Only consider the beat if the inter-beat interval is within a reasonable range.
+    // Only count beats when contact is confirmed — prevents noise and floating-pin false beats.
     if (justBeat && isContactConfirmed()) {
         if (bpmReasonable) {
             bpmHistory[bpmHistoryIndex] = myBPM; // Add to rolling BPM history for averaging
@@ -206,27 +387,23 @@ prevContactGood = contactGood;
             justBeatFlag = true;
 
             int stable = getStableBPM(); // Get the current stable BPM average for diagnostics
-            // Beat detected — print in red for visibility
-            Serial.print(COLOR_RED); 
+            Serial.print(COLOR_RED);
             Serial.print("♥  Beat detected!");
-            Serial.print(COLOR_RESET);
-            Serial.print(" | RAW: "); // Diagnostics for raw signal on beat
+            Serial.print(" | RAW: ");
             Serial.print(rawSample);
             Serial.print(" | BPM: ");
             Serial.print(myBPM);
-            // If we have a stable BPM average, print it; otherwise indicate we're still warming up.
             if (stable > 0) {
                 Serial.print(" | ♥ Stable BPM: ");
                 Serial.print(stable);
-            }
-            // Still warming up — not enough valid beats for stable BPM average. 
-            else { 
-                Serial.print(" | Warming up (");
+            } else {
+                Serial.print(" | Gathering beats (");
                 Serial.print(bpmHistoryCount);
                 Serial.print("/");
                 Serial.print(BPM_HISTORY_SIZE);
                 Serial.print(")");
             }
+            Serial.print(COLOR_RESET);
             Serial.println();
             // Start the beat pulse at a bright value; it will decay in heartbeatBrightness() and applyHeartbeatPulse().
             lastBeatMs = now;
@@ -239,13 +416,15 @@ prevContactGood = contactGood;
         }
     }
 
-    // No confirmed contact:
-    // Reset heartbeat state so old BPM averages, pulse brightness, or beat flags do not linger
-    // after the finger is removed.
+    // Beat animation: clear on any confirmation drop to prevent phantom flashes.
     if (!isContactConfirmed()) {
-        bpmHistoryCount = 0;
         beatPeak = 0;
         justBeatFlag = false;
+    }
+    // BPM history: only reset when contact is fully gone (hold timer expired).
+    // Keeping it alive through brief signal dips prevents heartbeatActive from flickering.
+    if (!getContactGood()) {
+        bpmHistoryCount = 0;
     }
 
     // Quadratic ease-out decay: drops fast then tapers — more like a real heartbeat pulse.

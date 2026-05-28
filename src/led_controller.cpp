@@ -27,27 +27,28 @@ static uint8_t redLevel = 0;    // 0 = black, 255 = full red
 void drawFrame(bool contact, bool confirmed, uint8_t bpm) {
     if (confirmed) {
         // Confirmed: finish fading purple out, then fade red in.
-        if (bgLevel > 0)   bgLevel  = (bgLevel  > 3) ? bgLevel  - 3 : 0;
-        else               redLevel = (redLevel < 251) ? redLevel + 4 : 255;
+        if (bgLevel > 0)   bgLevel  = (bgLevel  > 2) ? bgLevel  - 2 : 0;
+        else               redLevel = (redLevel < 252) ? redLevel + 3 : 255;
     } else if (contact) {
-        // Contact detected but not yet confirmed — fade purple to black quickly
-        // so the user sees the strip respond, but no red shows until confirmed.
-        bgLevel = (bgLevel > 8) ? bgLevel - 8 : 0;
+        // Contact detected but not yet confirmed — slowly dim purple over the confirmation window.
+        // Rate matched to CONTACT_CONFIRM_MS so the strip reaches dark just as red begins.
+        // Slow rate also means brief false-contact readings barely affect bgLevel.
+        bgLevel = (bgLevel > 1) ? bgLevel - 1 : 0;
     } else {
         // No contact: fade red out first, then bring purple back.
-        if (redLevel > 0)  redLevel = (redLevel > 3) ? redLevel - 3 : 0;
-        else               bgLevel  = (bgLevel  < 253) ? bgLevel  + 2 : 255;
+        if (redLevel > 0)  redLevel = (redLevel > 4) ? redLevel - 4 : 0;
+        else               bgLevel  = (bgLevel  < 252) ? bgLevel  + 5 : 255;
     }
 
     // Compute colours once per frame, not per LED.
-    uint8_t purpleBrightness = scale8(beatsin8(6, 60, 160), bgLevel);
+    uint8_t purpleBrightness = scale8(beatsin8(6, 5, 80), bgLevel);
     uint8_t pulseBPM         = (bpm > 0) ? bpm : 60;
     uint8_t redBrightness    = scale8(beatsin8(pulseBPM, 0, 220), redLevel);
 
+    // Single-sensor mode: full strip follows Person A.
+    // When Person B is wired, restore: if (confirmed && i >= NUM_LEDS / 2) leds[i] = CRGB::Black;
     for (uint16_t i = 0; i < NUM_LEDS; ++i) {
-        if (confirmed && i >= NUM_LEDS / 2) {
-            leds[i] = CRGB::Black;  // Second half reserved for Person B.
-        } else if (redLevel > 0) {
+        if (redLevel > 0) {
             leds[i] = CRGB(redBrightness, 0, 0);
         } else {
             leds[i] = CHSV(200, 180, purpleBrightness);

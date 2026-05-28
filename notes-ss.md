@@ -2,6 +2,15 @@
 
 https://github.com/WorldFamousElectronics/PulseSensorPlayground/tree/master/examples/Getting_BPM_to_Monitor
 
+# To Do
+
+Create box with finger cutout
+
+Add ⬆︎⬇︎arrows showing the average going up or down to the right of the red line shwoing the stable bpm so it's easier to debug.
+
+1. The Idle state is still never showing (purple)
+2. The lights are still flicking at different rates. Right now only 1 HB sensor is connected so lights should all be synced, is that the problem?
+
 # Startup 
 git pull
 

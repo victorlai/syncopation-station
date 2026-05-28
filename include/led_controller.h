@@ -4,7 +4,8 @@
 
 // LED strip settings
 constexpr uint8_t LED_PIN = D2;
-constexpr uint16_t NUM_LEDS = 60;
+// Total number of LEDs in the strip. Adjust if you use a different length.
+constexpr uint16_t NUM_LEDS = 20; // 60 in 1m strip. Use less for testing
 
 // Global brightness (0–255) reference:
 // 2–10   = nighttime ambient glow
