@@ -22,6 +22,8 @@ extern CRGB leds[NUM_LEDS];
 
 // LED controller functions
 void setupLedController();
-void drawFrame(uint8_t beat, bool contact); // Handles all states and transitions in one call.
+// contact  = finger detected (starts fast purple→black fade immediately)
+// confirmed = held long enough (starts red fade in, enables pulses)
+void drawFrame(bool contact, bool confirmed, uint8_t bpm);
 void showLeds();
 void clearLeds();

@@ -15,14 +15,6 @@ The installation is designed to:
 * create an immersive glowing pulse environment
 * blend technology with embodied human experience
 
-Current development includes:
-
-* dual heartbeat sensing
-* WS2812B LED animations
-* threshold and signal filtering
-* startup / idle states
-* future proximity sensing and audio feedback
-
 ⸻
 
 Hardware
@@ -33,12 +25,12 @@ Controller
 
 Sensors
 
-* 2x Pulse Sensor Amped heartbeat sensors
+* 2x Pulse Sensor Amped heartbeat sensors (1 active, 1 pending wiring)
 * Optional VL53L0X / VL53L1X distance sensor
 
 Lighting
 
-* WS2812B LED Strip
+* WS2812B LED Strip (60 LEDs)
 * Diffusion tubing / silicone neon tubing
 
 Audio (planned)
@@ -49,7 +41,7 @@ Audio (planned)
 Power
 
 * USB-C power
-* Portable battery bank
+* 20,000mAh portable battery bank (~3 day runtime at current power settings)
 * Future AC installation power option
 
 ⸻
@@ -63,7 +55,7 @@ IDE
 Extensions
 
 * PlatformIO
-* GitHub Copilot
+* Claude Code (AI assistant)
 
 Framework
 
@@ -71,9 +63,8 @@ Framework
 
 Main Libraries
 
-FastLED
-Wire
-PulseSensorPlayground (optional)
+* FastLED
+* PulseSensorPlayground
 
 ⸻
 
@@ -81,13 +72,15 @@ PlatformIO Setup
 
 Board Configuration
 
-Use:
-
 [env:seeed_xiao_esp32s3]
 platform = espressif32
 board = seeed_xiao_esp32s3
 framework = arduino
 monitor_speed = 115200
+monitor_filters = direct
+
+Note: monitor_filters = direct is required for ANSI colour codes to render in the terminal.
+Use pio device monitor in the VS Code integrated terminal to see coloured output.
 
 ⸻
 
@@ -95,58 +88,108 @@ Current Features
 
 Heartbeat Detection
 
-* Reads analog pulse data
-* Detects beats using thresholds
-* Calculates BPM
-* Filters false readings
+* Reads analog pulse data via PulseSensorPlayground
+* Detects beats using a tunable threshold (12-bit ADC, default 1930)
+* Rolling 5-beat BPM average for stable readings
+* Contact quality detection using signal variance over an 800ms rolling window — prevents false positives from a floating sensor
+* Contact hold timer (2500ms) absorbs brief finger shifts without dropping state
+* Contact confirmation delay (2000ms) — strip stays in standby until a real hold is detected
 
-LED Feedback
+LED Behaviour
 
-* Pulse-reactive brightness
-* Startup animations
-* Rainbow flowing idle effects
-* Future dual-person synchronization effects
+Standby (no contact)
+* Slow purple breathing across the full strip (~10s per cycle)
 
-Serial Monitor States
+Contact detected — warm-up (0–2s)
+* Strip stays purple — prevents false positives from lighting up
 
-Example output:
+Contact confirmed (after 2s)
+* Strip transitions: purple fades to black, then red breathes in
+* First half of strip (LEDs 0–29) glows red, pulsing at the person's BPM
+* Second half (LEDs 30–59) stays dark — reserved for Person B
 
-❤️ BEAT | BPM: 78
-✅ READY / MONITORING
-⚠️ POSSIBLE CONTACT LOST
+Connection Pulse
+* On each confirmed beat, a soft red pulse spawns at the left edge and travels toward the centre
+* Pulse uses a Gaussian falloff curve — no hard edges, fades organically
+* Multiple pulses visible simultaneously at faster heart rates
+* Pulses stop at the centre (Person B's pulses will travel inward from the right)
+
+Release
+* Red fades to black, then purple breathes back in
+* Gradual transition — never jumps directly between colours
+
+Power Management
+* FastLED hard cap: 500mA total draw
+* Global brightness: 100/255
+* Estimated runtime: ~3 days on a 20,000mAh bank
+
+Serial Monitor Output
+
+Example (view in integrated terminal with pio device monitor):
+
+CONTACT: GOOD | RAW: 1845 | IBI: 823ms | BPM: 72
+♥  Beat detected! | RAW: 1845 | BPM: 72 | Stable: 71
+⚠️  Beat ignored | IBI: 252ms
+
+⸻
+
+Code Structure
+
+src/main.cpp          — Main loop: reads sensor, drives LED layers
+src/heartbeat.cpp     — Sensor reading, BPM averaging, contact state
+src/led_controller.cpp — Background layer: standby and contact colour states
+src/connection_pulse.cpp — Travelling pulse animation layer
+
+include/heartbeat.h
+include/led_controller.h
+include/connection_pulse.h
+
+Key tunable constants:
+
+CONTACT_CONFIRM_MS   heartbeat.cpp   How long to hold finger before strip responds (default 2000ms)
+CONTACT_HOLD_MS      heartbeat.cpp   How long to stay active after contact drops (default 2500ms)
+CONTACT_MIN_RANGE    heartbeat.cpp   Signal swing required to count as contact (default 200 ADC counts)
+BPM_HISTORY_SIZE     heartbeat.cpp   Beats averaged for stable BPM (default 5)
+PULSE_SPEED          connection_pulse.cpp   Pulse travel speed in LEDs/frame (default 0.5)
+PULSE_SIGMA_SQ       connection_pulse.cpp   Pulse blob softness (default 6.0)
+BRIGHTNESS           led_controller.h       Global LED brightness 0–255 (default 100)
+MAX_MILLIAMPS        led_controller.h       Power cap in mA (default 500)
 
 ⸻
 
 Development Roadmap
 
-Phase 1
+Phase 1 — Complete
 
-* ESP32 setup
-* LED strip control
-* Heartbeat sensor reading
-* Threshold tuning
-* Two simultaneous heartbeat sensors
-* Stable BPM averaging
+* ESP32 setup and LED strip control
+* Heartbeat sensor reading with threshold tuning
+* Signal variance contact detection
+* Rolling BPM average
+* Stable BPM confirmation gate
 
-Phase 2
+Phase 2 — In Progress
 
-* LED pulse mapped to heartbeat
-* Shared synchronization patterns
-* Ambient idle states
-* Startup / connection sequence
+* LED breathing mapped to heartbeat BPM ✓
+* Standby / contact / release colour transitions ✓
+* Connection Pulse animation (Person A) ✓
+* Split strip — Person A left half, Person B right half ✓
+* Second heartbeat sensor (Person B) — pending wiring
+* Dual pulse animation — pulses travelling toward each other
+* Sync detection — compare BPMs between participants
+* Sync bloom — warm centre glow when BPMs align
+* Test calming vs energetic sync visual states
 
 Phase 3
 
 * Resonance speaker testing
 * Heartbeat audio pulses
 * Reactive vibration surface
-* Proximity sensing
+* Proximity sensing (VL53L0X)
 
 Phase 4
 
 * Installation enclosure
-* Power optimization
-* Long-duration stability testing
+* Long-duration stability testing (3+ days)
 * Festival-ready deployment
 
 ⸻
@@ -155,17 +198,19 @@ Wiring Notes
 
 WS2812B
 
-LED Strip	ESP32
-DIN	D2
-5V	5V
-GND	GND
+LED Strip    ESP32
+DIN          D2
+5V           5V (direct from USB-C recommended for full strip)
+GND          GND
 
 Pulse Sensor
 
-Sensor	ESP32
-Signal	D3 (Analog)
-VCC	3.3V
-GND	GND
+Sensor       ESP32
+Signal       D3 (Analog)
+VCC          3.3V
+GND          GND
+
+Second sensor (Person B) — pin TBD when wiring added.
 
 ⸻
 
@@ -185,34 +230,19 @@ Common Issues
 
 Serial Port Locked
 
-Close:
-
-* Serial Monitor
-* Arduino IDE
-* other VSCode windows
-
-Then reconnect the board.
+Close the PlatformIO serial monitor panel, then run pio device monitor in the integrated terminal instead.
 
 Only First LED Works
 
 Usually caused by:
 
-* wrong LED chipset
+* wrong LED chipset (must be WS2812B)
 * incorrect data pin
-* insufficient power
-* damaged first LED
+* insufficient power — power the strip directly from USB-C, not through the ESP32
 
-Copilot Chat Errors
+ANSI Colours Not Showing
 
-If you see:
-
-Cannot read properties of undefined (reading 'bind')
-
-Try:
-
-* reloading VSCode
-* reinstalling Copilot Chat
-* disabling conflicting AI extensions
+The PlatformIO serial panel does not render ANSI codes. Use the VS Code integrated terminal and run pio device monitor — colours will display correctly.
 
 ⸻
 

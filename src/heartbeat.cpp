@@ -36,12 +36,12 @@ static bool contactWindowFull = false;
 
 // Minimum and maximum accepted beat interval.
 // This prevents fast false beats from showing as high BPM.
-static const int MIN_ACCEPTABLE_IBI_MS = 500;   // 120 BPM max
+static const int MIN_ACCEPTABLE_IBI_MS = 428;   // 140 BPM max // 500 is 120 BP Max
 static const int MAX_ACCEPTABLE_IBI_MS = 1500;  // 40 BPM min
 
 // Rolling BPM average — requires this many consecutive valid beats before
 // reporting a stable BPM. Raise to be more conservative, lower to respond faster.
-static const int BPM_HISTORY_SIZE = 5;
+static const int BPM_HISTORY_SIZE = 6;  // Number of valid beats to average for stable BPM reading. Adjust to taste. 5 is a good balance for responsiveness while filtering outliers. 10 can be for live.
 static int bpmHistory[BPM_HISTORY_SIZE] = {0};
 static int bpmHistoryIndex = 0;
 static int bpmHistoryCount = 0;
@@ -58,10 +58,19 @@ static uint8_t beatPeak = 0;
 // Exposed contact state for LED transitions.
 static bool lastContactGood = false;
 
+// Set true for one frame when a valid beat is confirmed. Read via getJustBeat().
+static bool justBeatFlag = false;
+
 // How long to hold "contact good" after signal goes POOR — absorbs finger shifts.
 // Raise if transitions to purple feel too trigger-happy. Lower if you want faster response.
 static const unsigned long CONTACT_HOLD_MS = 2500;
 static unsigned long lastContactGoodTime = 0;
+
+// How long contact must be held before the strip commits to sensing state (red + pulses).
+// Prevents false positives from triggering colour changes. Adjust to taste.
+static const unsigned long CONTACT_CONFIRM_MS = 2000;
+static unsigned long contactStartMs = 0;
+static bool prevContactGood = false;
 
 void setupHeartbeat() {
     // Start serial output for debugging and monitoring.
@@ -90,6 +99,25 @@ void setupHeartbeat() {
 bool getContactGood() {
     return lastContactGood || (millis() - lastContactGoodTime < CONTACT_HOLD_MS);
 }
+
+// True only after contact has been held continuously for CONTACT_CONFIRM_MS.
+// Use this to gate visual state changes — prevents false positives lighting up the strip.
+bool isContactConfirmed() {
+    if (!getContactGood()) return false;
+
+    // No real contact has started yet.
+    // Prevents millis() - 0 from instantly confirming after boot.
+    if (contactStartMs == 0) return false;
+
+    return millis() - contactStartMs >= CONTACT_CONFIRM_MS;
+}
+
+// Returns true exactly once per valid beat, then resets. Use to trigger pulse spawning.
+bool getJustBeat() {
+    bool result = justBeatFlag;
+    justBeatFlag = false;
+    return result;
+}
 // Returns the averaged BPM once enough consecutive valid beats are collected.
 // Returns 0 if still warming up or if contact has been lost.
 int getStableBPM() {
@@ -116,7 +144,7 @@ uint8_t heartbeatBrightness() {
     bool insideBeat = pulseSensor.isInsideBeat();
     int myBPM = pulseSensor.getBeatsPerMinute();
     int interBeatInterval = pulseSensor.getInterBeatIntervalMs();
-    bool bpmReasonable = (interBeatInterval >= 428 && interBeatInterval <= 1500);
+    bool bpmReasonable = (interBeatInterval >= MIN_ACCEPTABLE_IBI_MS && interBeatInterval <=MAX_ACCEPTABLE_IBI_MS);
 
     // Update rolling contact window and compute signal range.
     contactSamples[contactIdx] = rawSample;
@@ -130,6 +158,21 @@ uint8_t heartbeatBrightness() {
         if (contactSamples[i] > cMax) cMax = contactSamples[i];
     }
     bool contactGood = (rawSample > 1200 && rawSample < 2900) && (cMax - cMin >= CONTACT_MIN_RANGE);
+    
+    // Start the confirmation timer only on a genuine rising edge — when contact was fully absent.
+    // The contactStartMs == 0 guard prevents brief signal dips (which happen naturally between
+    // heartbeat peaks) from restarting the timer. The hold timer handles those micro-drops.
+    if (contactGood && !prevContactGood && contactStartMs == 0) {
+        contactStartMs = now;
+    }
+    // Fully reset confirmation timing after contact has been gone longer than the hold window.
+    // Prevents stale timestamps from causing instant re-confirmation from sensor noise later.
+    if (!contactGood && millis() - lastContactGoodTime >= CONTACT_HOLD_MS) {
+        contactStartMs = 0;
+    }
+
+prevContactGood = contactGood;
+    
     lastContactGood = contactGood;
     if (contactGood) lastContactGoodTime = now;
 
@@ -154,12 +197,13 @@ uint8_t heartbeatBrightness() {
     }
 
     // Only consider the beat if the inter-beat interval is within a reasonable range.
-    if (justBeat) { 
+    if (justBeat && isContactConfirmed()) {
         if (bpmReasonable) {
             bpmHistory[bpmHistoryIndex] = myBPM; // Add to rolling BPM history for averaging
             bpmHistoryIndex = (bpmHistoryIndex + 1) % BPM_HISTORY_SIZE; 
             if (bpmHistoryCount < BPM_HISTORY_SIZE) bpmHistoryCount++; // Track how many valid beats we've seen for stable BPM calculation
-            lastValidBeatTime = now; // Update last valid beat time for BPM reset logic
+            lastValidBeatTime = now;
+            justBeatFlag = true;
 
             int stable = getStableBPM(); // Get the current stable BPM average for diagnostics
             // Beat detected — print in red for visibility
@@ -172,7 +216,7 @@ uint8_t heartbeatBrightness() {
             Serial.print(myBPM);
             // If we have a stable BPM average, print it; otherwise indicate we're still warming up.
             if (stable > 0) {
-                Serial.print(" | Stable: ");
+                Serial.print(" | ♥ Stable BPM: ");
                 Serial.print(stable);
             }
             // Still warming up — not enough valid beats for stable BPM average. 
@@ -195,10 +239,21 @@ uint8_t heartbeatBrightness() {
         }
     }
 
-    // If a beat happened recently, return a decaying brightness flash.
+    // No confirmed contact:
+    // Reset heartbeat state so old BPM averages, pulse brightness, or beat flags do not linger
+    // after the finger is removed.
+    if (!isContactConfirmed()) {
+        bpmHistoryCount = 0;
+        beatPeak = 0;
+        justBeatFlag = false;
+    }
+
+    // Quadratic ease-out decay: drops fast then tapers — more like a real heartbeat pulse.
+    // At 50% through: 25% brightness. At 75%: 6%. Much smoother than linear.
     unsigned long elapsed = now - lastBeatMs;
     if (elapsed < BEAT_DECAY_MS) {
-        pulse = map(elapsed, 0, BEAT_DECAY_MS, beatPeak, 0);
+        uint32_t remaining = BEAT_DECAY_MS - elapsed;
+        pulse = (uint32_t)beatPeak * remaining * remaining / ((uint32_t)BEAT_DECAY_MS * BEAT_DECAY_MS);
     }
 
     return pulse; // Return the current pulse brightness for this frame; 0 if no beat or after decay.

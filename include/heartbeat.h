@@ -17,3 +17,9 @@ int getStableBPM();
 
 // Returns true if the sensor currently has good finger contact
 bool getContactGood();
+
+// Returns true only after contact has been held for CONTACT_CONFIRM_MS — use this to gate visuals
+bool isContactConfirmed();
+
+// Returns true once per valid beat, then resets — use to trigger pulse spawning
+bool getJustBeat();

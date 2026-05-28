@@ -19,31 +19,38 @@ void setupLedController() {
     FastLED.show();
 }
 
-// bgLevel tracks the purple standby brightness: 255 = full purple, 0 = black.
-// It fades toward 0 when contact is detected, and back to 255 when released.
-static uint8_t bgLevel = 255;
+// Two-phase transition: purple fades to black first, then red fades in. Reverses on release.
+// This ensures we never jump directly between purple and red.
+static uint8_t bgLevel  = 255;  // 255 = full purple, 0 = black
+static uint8_t redLevel = 0;    // 0 = black, 255 = full red
 
-void drawFrame(uint8_t beat, bool contact) {
-    // Fade purple out when finger is on sensor, fade back in when released.
-    // Different speeds: faster to black (deliberate sensing feel), slower back to purple (relaxing release).
-    if (contact) {
-        bgLevel = bgLevel > 4 ? bgLevel - 4 : 0;
+void drawFrame(bool contact, bool confirmed, uint8_t bpm) {
+    if (confirmed) {
+        // Confirmed: finish fading purple out, then fade red in.
+        if (bgLevel > 0)   bgLevel  = (bgLevel  > 3) ? bgLevel  - 3 : 0;
+        else               redLevel = (redLevel < 251) ? redLevel + 4 : 255;
+    } else if (contact) {
+        // Contact detected but not yet confirmed — fade purple to black quickly
+        // so the user sees the strip respond, but no red shows until confirmed.
+        bgLevel = (bgLevel > 8) ? bgLevel - 8 : 0;
     } else {
-        bgLevel = bgLevel < 253 ? bgLevel + 2 : 255;
+        // No contact: fade red out first, then bring purple back.
+        if (redLevel > 0)  redLevel = (redLevel > 3) ? redLevel - 3 : 0;
+        else               bgLevel  = (bgLevel  < 253) ? bgLevel  + 2 : 255;
     }
 
-    // Draw purple standby background, scaled by bgLevel (disappears on contact).
+    // Compute colours once per frame, not per LED.
     uint8_t purpleBrightness = scale8(beatsin8(6, 60, 160), bgLevel);
-    CRGB bg = CHSV(200, 180, purpleBrightness);
-    for (uint16_t i = 0; i < NUM_LEDS; ++i) {
-        leds[i] = bg;
-    }
+    uint8_t pulseBPM         = (bpm > 0) ? bpm : 60;
+    uint8_t redBrightness    = scale8(beatsin8(pulseBPM, 0, 220), redLevel);
 
-    // Overlay beat additively — red decays to black, never to purple.
-    if (beat > 0) {
-        CRGB beatColor = CHSV(0, 220, beat);
-        for (uint16_t i = 0; i < NUM_LEDS; ++i) {
-            leds[i] += beatColor;
+    for (uint16_t i = 0; i < NUM_LEDS; ++i) {
+        if (confirmed && i >= NUM_LEDS / 2) {
+            leds[i] = CRGB::Black;  // Second half reserved for Person B.
+        } else if (redLevel > 0) {
+            leds[i] = CRGB(redBrightness, 0, 0);
+        } else {
+            leds[i] = CHSV(200, 180, purpleBrightness);
         }
     }
 }
