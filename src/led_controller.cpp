@@ -41,14 +41,20 @@ static uint16_t drainLitAtStart = NUM_LEDS;
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 // Render `litCount` red LEDs with a gradient (dim at index 0, bright at leading edge).
-static void renderGatherLEDs(uint16_t litCount) {
+// blinkLeading: leading LED flashes on/off at ~300 ms to signal "waiting for next beat".
+static void renderGatherLEDs(uint16_t litCount, bool blinkLeading = false) {
+    bool leadOn = !blinkLeading || ((millis() / 300) % 2 == 0);
     for (uint16_t i = 0; i < NUM_LEDS; i++) {
         if (i < litCount) {
-            uint8_t bright = (litCount > 1)
-                ? (uint8_t)map(i, 0, litCount - 1, 40, 180)
-                : 140;
-            if (i == litCount - 1) bright = 220; // leading-edge pop
-            leds[i] = CRGB(bright, 0, 0);
+            if (i == litCount - 1 && !leadOn) {
+                leds[i] = CRGB::Black;
+            } else {
+                uint8_t bright = (litCount > 1)
+                    ? (uint8_t)map(i, 0, litCount - 1, 40, 180)
+                    : 140;
+                if (i == litCount - 1) bright = 220; // leading-edge pop
+                leds[i] = CRGB(bright, 0, 0);
+            }
         } else {
             leds[i] = CRGB::Black;
         }
@@ -66,9 +72,13 @@ void drawFrame(bool possibleContact, bool contact, bool confirmed,
     // Target: 1 LED per beat while gathering; jumps to full strip when stable BPM found.
     const float riseSpeed = (float)NUM_LEDS * 10.0f / CONNECTING_FILL_MS;
     float targetLit = 0.0f;
-    if (animPhase == PHASE_GATHER || animPhase == PHASE_HOLD || animPhase == PHASE_PULSE) {
-        targetLit = (bpm > 0) ? (float)NUM_LEDS
-                              : min((float)NUM_LEDS, (float)beatCount * GATHER_LEDS_PER_BEAT);
+    if (animPhase == PHASE_GATHER) {
+        // Floor at GATHER_LEDS_PER_BEAT; each beat adds 1 LED so progression is 3→4→5→6…
+        float beatTarget = max((float)GATHER_LEDS_PER_BEAT,
+                               min((float)NUM_LEDS, (float)GATHER_LEDS_PER_BEAT + (float)beatCount));
+        targetLit = (bpm > 0) ? (float)NUM_LEDS : beatTarget;
+    } else if (animPhase == PHASE_HOLD || animPhase == PHASE_PULSE) {
+        targetLit = (float)NUM_LEDS;
     }
     if (smoothLitLEDs < targetLit) smoothLitLEDs = min(smoothLitLEDs + riseSpeed, targetLit);
     else                           smoothLitLEDs = max(smoothLitLEDs - riseSpeed, targetLit);
@@ -109,7 +119,7 @@ void drawFrame(bool possibleContact, bool contact, bool confirmed,
             if (confirmed) {
                 animPhase     = PHASE_GATHER;
                 bgLevel       = 0;
-                smoothLitLEDs = 0.0f;
+                smoothLitLEDs = 1.0f; // start at 1 LED → rises to 3 before first beat
             } else if (possibleContact) {
                 animPhase = PHASE_POSSIBLE;
             }
@@ -120,7 +130,7 @@ void drawFrame(bool possibleContact, bool contact, bool confirmed,
             if (confirmed) {
                 animPhase     = PHASE_GATHER;
                 bgLevel       = 0;
-                smoothLitLEDs = 0.0f;
+                smoothLitLEDs = 1.0f; // start at 1 LED → rises to 3 before first beat
             } else if (!possibleContact && !contact) {
                 animPhase = PHASE_IDLE;
             }
@@ -198,14 +208,13 @@ void drawFrame(bool possibleContact, bool contact, bool confirmed,
         }
 
         case PHASE_POSSIBLE: {
-            // Scanner stops; single blinking LED signals possible contact.
-            fill_solid(leds, NUM_LEDS, CRGB::Black);
-            leds[0] = ((now / 250) % 2) ? CRGB(200, 0, 0) : CRGB::Black;
+            // Scanner lands: show first 3 LEDs steady so the user sees a clear "touch registered".
+            renderGatherLEDs(3);
             break;
         }
 
         case PHASE_GATHER:
-            renderGatherLEDs((uint16_t)smoothLitLEDs);
+            renderGatherLEDs((uint16_t)smoothLitLEDs, true);
             break;
 
         case PHASE_HOLD:

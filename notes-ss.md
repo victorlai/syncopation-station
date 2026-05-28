@@ -4,6 +4,8 @@ https://github.com/WorldFamousElectronics/PulseSensorPlayground/tree/master/exam
 
 # To Do
 
+Test with external power supply.
+
 Add an indicator to train user to press the right way.
 
 Create box with finger cutout
