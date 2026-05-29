@@ -10,8 +10,15 @@ void setup() {
 }
 
 void loop() {
-    // Press 'c' in the serial monitor to run contact calibration at any time.
-    if (Serial.available() && Serial.read() == 'c') runCalibration();
+    // Serial commands (case-insensitive): c = calibration, s = sync animation (test toggle)
+    if (Serial.available()) {
+        char cmd = tolower(Serial.read());
+        if (cmd == 'c') runCalibration();
+        if (cmd == 's') {
+            if (isSyncAnimActive()) cancelSyncAnimation();
+            else                    triggerSyncAnimation();
+        }
+    }
 
     // Returns a decaying brightness value (220→0 over BEAT_DECAY_MS) on each confirmed beat.
     uint8_t pulse = heartbeatBrightness();

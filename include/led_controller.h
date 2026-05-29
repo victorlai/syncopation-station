@@ -43,3 +43,10 @@ void drawFrame(bool possibleContact, bool contact, bool confirmed,
                int beatCount, uint8_t bpm, uint8_t beatPulse = 0);
 void showLeds();
 void clearLeds();
+
+// Trigger the 15-second synchronized animation sequence.
+// For testing: press 'S' in the serial monitor.
+// Production: call when both sensors confirm sync.
+void triggerSyncAnimation();
+void cancelSyncAnimation();  // typing 's' again cancels and returns to IDLE
+bool isSyncAnimActive();

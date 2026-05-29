@@ -102,7 +102,7 @@ Heartbeat Detection
 
 LED Behaviour — State Machine
 
-The strip runs a 6-phase state machine. All phases use red. There is no purple in the current build.
+The strip runs a 7-phase state machine. All phases use red tones except the SYNC sequence. There is no purple in the current build.
 
 IDLE (no finger detected)
 * A 5-LED red pulse sweeps back and forth across the strip, centre LED brightest (brightness profile: 12, 45, 110, 45, 12)
@@ -110,18 +110,19 @@ IDLE (no finger detected)
 
 POSSIBLE (earliest finger hint)
 * Triggered by 2 consecutive near-zero ADC samples
-* The scanner "lands": first 3 LEDs hold steady (no blinking)
+* The scanner "lands": first 3 LEDs hold steady
 * Prompts the user to hold still and confirm placement
 
 GATHER (contact confirmed, collecting beats)
-* Starts at 3 LEDs (= NUM_LEDS / 6)
-* Each confirmed beat adds 1 more LED: 3 → 4 → 5 → 6 …
-* The leading (outermost) LED blinks at ~300 ms to signal "waiting for next beat"
-* When a stable BPM is locked, remaining LEDs fill rapidly to the full strip
+* Starts at 3 solid LEDs (= NUM_LEDS / 6), tip showing a 3-LED VU meter that bounces 0→3→0 at 70 BPM rate to signal "waiting for next beat"
+* On each confirmed beat: a 3-LED pulse launches from the current fill edge and travels to the new proportional target
+  - 1/4 beats → 25% of strip, 2/4 → 50%, 3/4 → 75%
+  - Fill commits when pulse arrives; tip resumes VU meter bounce
+* When all beats are collected and BPM locks, remaining LEDs fill rapidly to full strip
 
 HOLD (stable BPM locked)
-* All LEDs solid red
-* Brief pause (500 ms) before switching to pulse mode
+* All LEDs solid red (brightness 200)
+* 500 ms pause before entering pulse mode
 
 PULSE (beat-locked heartbeat animation)
 * On each beat: strip snaps bright red, decays quadratically to a dim glow over the inter-beat interval
@@ -135,6 +136,19 @@ DRAIN (contact lost)
 * Strip wipes right-to-left to black over 800 ms
 * If contact returns mid-drain, jumps straight back to PULSE
 
+SYNC (two-sensor synchronization — testable via serial)
+* ~28-second artistic sequence triggered when both participants' heartbeats synchronize
+* 0–3 s     Pulses: 3 full-strip red flashes, bright to dark
+* 3–4.6 s   Wipe: LEDs turn off from both ends inward until only the centre 3 remain
+* 4.6–7.6 s Shift: centre 3 transition red → orange → yellow → magenta
+* 7.6–10.6 s Storm: frantic magenta sparks scatter across the full strip (electrical storm feel)
+* 10.6–13.6 s Zaps: 10 rapid pulses fire simultaneously from the centre toward both ends
+* 13.6–14.6 s Rise: strip fades up from black to full red
+* 14.6–19.6 s Glow: full strip pulses to the participant's live BPM (quadratic decay, same feel as PULSE state; falls back to 70 BPM if no reading)
+* 19.6–24.6 s Fade: slow fade to black
+* 24.6–27.6 s Silence: 3 seconds of darkness before returning to IDLE
+* Returns to IDLE when complete, or cancels immediately if triggered again
+
 ---
 
 Touch Feedback Design
@@ -143,13 +157,15 @@ The LED is the only feedback channel — the user cannot see the serial monitor.
 
 What the user sees → What it means
 
-  Red scanner bouncing        No finger detected — find the sensor
-  3 steady LEDs               Finger detected, hold still to confirm
-  LEDs climbing, tip blinking Contact confirmed — keep holding, beats being collected
-  LEDs filling rapidly        Stable heartbeat locked
-  Full strip pulsing          Synced — heartbeat detected and tracking
-  Strip shrinking from right  Beats slowing/stopping — adjust finger pressure or position
-  Strip wiping to black       Contact lost — try again
+  Red scanner bouncing             No finger detected — find the sensor
+  3 steady LEDs                    Finger detected, hold still to confirm
+  Solid fill + 3-LED VU tip        Contact confirmed — keep holding, collecting beats
+  Traveling pulse + fill extends   Beat detected — count advancing
+  LEDs filling rapidly             Stable heartbeat locked, entering pulse mode
+  Full strip pulsing to heartbeat  Tracking — stay still
+  Strip shrinking from right       Beats stopping — adjust finger pressure or position
+  Strip wiping to black            Contact lost — try again
+  Red pulses → wipe → storm → zaps  Sync sequence triggered (two-sensor sync)
 
 Training loop: if a participant shifts their finger and loses signal, the strip shrinks in real time. They see it degrade and learn to move back to the optimal position. The installation teaches itself without any screen or verbal instruction.
 
@@ -161,7 +177,8 @@ NUM_LEDS              20 (dev) / 60 (production)    Change this only — everyth
 BRIGHTNESS            100                            0–255 global FastLED brightness
 MAX_MILLIAMPS         NUM_LEDS × 25                  Auto-scales: 500 mA @ 20 LEDs, 1500 mA @ 60 LEDs
 GATHER_LEDS_PER_BEAT  NUM_LEDS / 6                   Starting floor in GATHER; 3 @ 20 LEDs, 10 @ 60 LEDs
-CONNECTING_FILL_MS    2500                           Rise speed from gather floor to full strip (ms)
+GATHER_BEAT_TOTAL     4                              Must match BPM_HISTORY_SIZE; used for proportional fill mapping
+CONNECTING_FILL_MS    2500                           Rise speed for final fill to full strip on BPM lock (ms)
 CONNECTING_HOLD_MS    500                            Hold duration in HOLD phase before PULSE (ms)
 DRAIN_MS              800                            Duration of right-to-left wipe on contact loss (ms)
 
@@ -170,7 +187,7 @@ Key Tunable Constants (src/heartbeat.cpp)
 CONTACT_CONFIRM_MS    How long to hold before state is confirmed (default 2000 ms)
 CONTACT_HOLD_MS       How long to stay active after contact drops (default 2500 ms)
 CONTACT_MIN_RANGE     Signal swing required to count as contact (default 200 ADC counts)
-BPM_HISTORY_SIZE      Beats collected before stable BPM is declared (default 5)
+BPM_HISTORY_SIZE      Beats collected before stable BPM is declared (default 4)
 
 ---
 
@@ -182,7 +199,10 @@ CONTACT: GOOD | RAW: 1845 | IBI: 823ms | BPM: 72
 ♥  Beat detected! | RAW: 1845 | BPM: 72 | Stable: 71
 ⚠️  Beat ignored | IBI: 252ms
 
-Press 'c' in the serial monitor to run contact calibration. Samples noise floor then three finger-on rounds, prints recommended CONTACT_MIN_RANGE.
+Serial commands (case-insensitive, type in the serial monitor):
+
+  c   Run contact calibration — samples noise floor then three finger-on rounds, prints recommended CONTACT_MIN_RANGE
+  s   Trigger the SYNC animation sequence (~28 s) — type again to cancel and reset immediately
 
 ---
 
@@ -190,7 +210,7 @@ Code Structure
 
 src/main.cpp              — Main loop: reads sensor, drives all LED layers
 src/heartbeat.cpp         — Sensor reading, BPM averaging, contact state machine
-src/led_controller.cpp    — Full 6-phase LED animation state machine
+src/led_controller.cpp    — Full 7-phase LED animation state machine (incl. SYNC sequence)
 src/connection_pulse.cpp  — Travelling pulse animation (reserved for two-sensor mode)
 src/sync.cpp              — Sync state tracking between two participants
 
@@ -212,17 +232,22 @@ Phase 1 — Complete
 
 Phase 2 — In Progress
 
-* Full 6-phase LED state machine (IDLE → POSSIBLE → GATHER → HOLD → PULSE → DRAIN) ✓
+* Full 7-phase LED state machine (IDLE → POSSIBLE → GATHER → HOLD → PULSE → DRAIN → SYNC) ✓
 * Beat-locked pulse animation with quadratic decay ✓
 * Degradation system: strip shrinks when beats are overdue ✓
 * Touch training feedback via LED state alone ✓
 * isPossibleContact() earliest-hint detection ✓
-* Auto-scaling constants (MAX_MILLIAMPS, GATHER_LEDS_PER_BEAT) ✓
+* Auto-scaling constants (MAX_MILLIAMPS, GATHER_LEDS_PER_BEAT, GATHER_BEAT_TOTAL) ✓
+* GATHER: proportional beat fill (1/4 → 25%, 2/4 → 50%, etc.) + 3-LED traveling pulse per beat ✓
+* GATHER: 3-LED VU meter bounce while waiting for next beat ✓
+* SYNC: ~28-second artistic sequence (pulses → wipe → colour shift → storm → zaps → glow → fade) ✓
+* SYNC: triggerable via serial 's'/'S', cancelable by typing again ✓
 * Second heartbeat sensor (Person B) — pending wiring
-* Split strip — Person A left half, Person B right half
-* Dual pulse animation — pulses travelling toward each other
+* Split strip — LED 0 and LED 59 at heart base; Person A from LED 0, Person B from LED 59 inward
+* Serial output in two columns (Person A left, Person B right) — pending second sensor
+* Dual pulse animation — pulses travelling toward each other from each end
 * Sync detection — compare BPMs between participants
-* Sync bloom — warm centre glow when BPMs align
+* Sync bloom — trigger SYNC sequence when both sensors confirm alignment
 
 Phase 3
 
