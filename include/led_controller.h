@@ -23,9 +23,10 @@ constexpr uint16_t MAX_MILLIAMPS = NUM_LEDS * 25;
 constexpr uint32_t CONNECTING_FILL_MS   = 2500;  // ms to fill strip from beat-count LEDs to full
 constexpr uint32_t CONNECTING_HOLD_MS   = 500;   // ms to hold fully lit before pulsing
 constexpr uint32_t DRAIN_MS             = 800;   // ms for right-to-left wipe when contact is lost
-// LEDs revealed per confirmed beat during gathering — ~1/6 of strip so 3 beats cover ~half,
-// leaving a satisfying "locked in" fill when stable BPM fires. Scales with strip length.
+// Starting LED count when entering GATHER — ~1/6 of strip so there's something to see immediately.
 constexpr uint8_t  GATHER_LEDS_PER_BEAT = NUM_LEDS / 6;
+// Must match BPM_HISTORY_SIZE in heartbeat.cpp. Used to map beat fraction → strip fraction.
+constexpr uint8_t  GATHER_BEAT_TOTAL    = 4;
 
 // Shared LED array
 extern CRGB leds[NUM_LEDS];

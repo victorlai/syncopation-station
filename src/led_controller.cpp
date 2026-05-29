@@ -38,23 +38,32 @@ static unsigned long animBeatMs    = 0;
 // DRAIN: how many LEDs were lit when the drain started (can be <NUM_LEDS if degraded).
 static uint16_t drainLitAtStart = NUM_LEDS;
 
+// GATHER: per-beat 3-LED traveling pulse.
+static int   prevBeatCount     = 0;
+static float gatherFillLevel   = 0.0f;  // committed fill; stays put while pulse travels
+static float gatherPulsePos    = 0.0f;  // traveling pulse head (fractional LED index)
+static float gatherPulseEnd    = 0.0f;  // pulse destination
+static bool  gatherPulseActive = false;
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 // Render `litCount` red LEDs with a gradient (dim at index 0, bright at leading edge).
-// blinkLeading: leading LED flashes on/off at ~300 ms to signal "waiting for next beat".
+// blinkLeading: last 3 positions animate as a bouncing VU meter (0→3→0 sine) while
+// the rest of the fill holds solid — signals "waiting for next beat".
 static void renderGatherLEDs(uint16_t litCount, bool blinkLeading = false) {
-    bool leadOn = !blinkLeading || ((millis() / 300) % 2 == 0);
+    uint16_t solidCount = (blinkLeading && litCount >= 3) ? litCount - 3 : litCount;
+    uint8_t  meterLit   = blinkLeading ? beatsin8(70, 0, 3) : 0;
+
+    static const uint8_t mbri[3] = { 100, 160, 220 };
+
     for (uint16_t i = 0; i < NUM_LEDS; i++) {
-        if (i < litCount) {
-            if (i == litCount - 1 && !leadOn) {
-                leds[i] = CRGB::Black;
-            } else {
-                uint8_t bright = (litCount > 1)
-                    ? (uint8_t)map(i, 0, litCount - 1, 40, 180)
-                    : 140;
-                if (i == litCount - 1) bright = 220; // leading-edge pop
-                leds[i] = CRGB(bright, 0, 0);
-            }
+        if (i < solidCount) {
+            uint8_t bright = (litCount > 1)
+                ? (uint8_t)map(i, 0, litCount - 1, 40, 180)
+                : 140;
+            leds[i] = CRGB(bright, 0, 0);
+        } else if (i < solidCount + meterLit) {
+            leds[i] = CRGB(mbri[i - solidCount], 0, 0);
         } else {
             leds[i] = CRGB::Black;
         }
@@ -73,10 +82,12 @@ void drawFrame(bool possibleContact, bool contact, bool confirmed,
     const float riseSpeed = (float)NUM_LEDS * 10.0f / CONNECTING_FILL_MS;
     float targetLit = 0.0f;
     if (animPhase == PHASE_GATHER) {
-        // Floor at GATHER_LEDS_PER_BEAT; each beat adds 1 LED so progression is 3→4→5→6…
-        float beatTarget = max((float)GATHER_LEDS_PER_BEAT,
-                               min((float)NUM_LEDS, (float)GATHER_LEDS_PER_BEAT + (float)beatCount));
-        targetLit = (bpm > 0) ? (float)NUM_LEDS : beatTarget;
+        if (bpm > 0) {
+            targetLit = (float)NUM_LEDS;  // locks in for HOLD transition
+        } else {
+            smoothLitLEDs = gatherFillLevel;  // pulse system owns movement; keep smoothLitLEDs in sync
+            targetLit     = gatherFillLevel;
+        }
     } else if (animPhase == PHASE_HOLD || animPhase == PHASE_PULSE) {
         targetLit = (float)NUM_LEDS;
     }
@@ -91,6 +102,24 @@ void drawFrame(bool possibleContact, bool contact, bool confirmed,
         animBeatMs = now;
         uint32_t target = 60000UL / (uint32_t)bpm;
         animPeriodMs = (animPeriodMs * 4 + target) / 5; // 80/20 EMA — drifts, never jumps
+    }
+
+    // ── GATHER: beat detection → spawn 3-LED traveling pulse ─────────────────
+    bool gatherBeatFired = (animPhase == PHASE_GATHER) && (bpm == 0) && (beatCount > prevBeatCount);
+    prevBeatCount = beatCount;
+    if (gatherBeatFired) {
+        gatherFillLevel   = gatherPulseEnd;   // commit previous destination to solid fill
+        gatherPulsePos    = gatherFillLevel;
+        gatherPulseEnd    = min((float)NUM_LEDS,
+                                (float)beatCount / (float)GATHER_BEAT_TOTAL * (float)NUM_LEDS);
+        gatherPulseActive = true;
+    }
+    if (animPhase == PHASE_GATHER && gatherPulseActive) {
+        gatherPulsePos = min(gatherPulsePos + 0.5f, gatherPulseEnd);
+        if (gatherPulsePos >= gatherPulseEnd) {
+            gatherFillLevel   = gatherPulseEnd;
+            gatherPulseActive = false;
+        }
     }
 
     // ── Connection level (PULSE only) ─────────────────────────────────────────
@@ -117,9 +146,14 @@ void drawFrame(bool possibleContact, bool contact, bool confirmed,
                 bgLevel = (bgLevel < 252) ? bgLevel + 5 : 255;
             }
             if (confirmed) {
-                animPhase     = PHASE_GATHER;
-                bgLevel       = 0;
-                smoothLitLEDs = 1.0f; // start at 1 LED → rises to 3 before first beat
+                animPhase         = PHASE_GATHER;
+                bgLevel           = 0;
+                smoothLitLEDs     = (float)GATHER_LEDS_PER_BEAT;
+                gatherFillLevel   = (float)GATHER_LEDS_PER_BEAT;
+                gatherPulsePos    = (float)GATHER_LEDS_PER_BEAT;
+                gatherPulseEnd    = (float)GATHER_LEDS_PER_BEAT;
+                gatherPulseActive = false;
+                prevBeatCount     = beatCount;
             } else if (possibleContact) {
                 animPhase = PHASE_POSSIBLE;
             }
@@ -128,9 +162,14 @@ void drawFrame(bool possibleContact, bool contact, bool confirmed,
         case PHASE_POSSIBLE:
             if (bgLevel > 0) bgLevel = (bgLevel > 1) ? bgLevel - 1 : 0;
             if (confirmed) {
-                animPhase     = PHASE_GATHER;
-                bgLevel       = 0;
-                smoothLitLEDs = 1.0f; // start at 1 LED → rises to 3 before first beat
+                animPhase         = PHASE_GATHER;
+                bgLevel           = 0;
+                smoothLitLEDs     = (float)GATHER_LEDS_PER_BEAT;
+                gatherFillLevel   = (float)GATHER_LEDS_PER_BEAT;
+                gatherPulsePos    = (float)GATHER_LEDS_PER_BEAT;
+                gatherPulseEnd    = (float)GATHER_LEDS_PER_BEAT;
+                gatherPulseActive = false;
+                prevBeatCount     = beatCount;
             } else if (!possibleContact && !contact) {
                 animPhase = PHASE_IDLE;
             }
@@ -172,8 +211,15 @@ void drawFrame(bool possibleContact, bool contact, bool confirmed,
                 // BPM history expired (8 s without a beat) — drop back to gather.
                 // smoothLitLEDs picks up from current degraded position (min 1) so
                 // the rebuild animation runs naturally from that point.
-                smoothLitLEDs = max(1.0f, connectionLevel * (float)NUM_LEDS);
-                animPhase     = PHASE_GATHER;
+                float resumeLevel = max((float)GATHER_LEDS_PER_BEAT,
+                                         connectionLevel * (float)NUM_LEDS);
+                smoothLitLEDs     = resumeLevel;
+                gatherFillLevel   = resumeLevel;
+                gatherPulsePos    = resumeLevel;
+                gatherPulseEnd    = resumeLevel;
+                gatherPulseActive = false;
+                prevBeatCount     = beatCount;
+                animPhase         = PHASE_GATHER;
             }
             break;
 
@@ -214,7 +260,24 @@ void drawFrame(bool possibleContact, bool contact, bool confirmed,
         }
 
         case PHASE_GATHER:
-            renderGatherLEDs((uint16_t)smoothLitLEDs, true);
+            if (bpm > 0) {
+                // BPM locked — smooth fill rising to full before HOLD.
+                renderGatherLEDs((uint16_t)smoothLitLEDs, false);
+            } else {
+                // Solid fill up to committed level.
+                renderGatherLEDs((uint16_t)gatherFillLevel, !gatherPulseActive);
+                // 3-LED traveling pulse: dim → mid → bright at head.
+                if (gatherPulseActive) {
+                    auto head = (int16_t)gatherPulsePos;
+                    static const int8_t  poff[3] = { -2, -1,  0 };
+                    static const uint8_t pbri[3] = { 80, 150, 230 };
+                    for (uint8_t j = 0; j < 3; j++) {
+                        int16_t idx = head + poff[j];
+                        if (idx >= 0 && idx < (int16_t)NUM_LEDS)
+                            leds[idx] = CRGB(pbri[j], 0, 0);
+                    }
+                }
+            }
             break;
 
         case PHASE_HOLD:
