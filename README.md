@@ -28,7 +28,7 @@ Controller
 
 Sensors
 
-* 2x Pulse Sensor Amped heartbeat sensors (1 active, 1 pending wiring)
+* 2x Pulse Sensor Amped heartbeat sensors (Sensor A → D3, Sensor B → D8)
 * Optional VL53L0X / VL53L1X distance sensor
 
 Lighting
@@ -44,8 +44,37 @@ Audio (planned)
 
 Power
 
-* USB-C power
-* 20,000mAh portable battery bank (~3 day runtime at current power settings)
+* USB-C power (5V 2A minimum; 5V 3A recommended at BRIGHTNESS > 150 or prolonged SYNC)
+* 20,000mAh portable battery bank
+
+Power draw at BRIGHTNESS=100, 60 LEDs:
+
+  State                        Draw
+  IDLE (5-LED scanner)         ~75 mA / 0.4 W
+  GATHER / PULSE (full red)    ~410 mA / 2.1 W
+  SYNC animation (magenta)     ~760 mA / 3.8 W  (FastLED caps at 1500 mA)
+
+Standby runtime (IDLE, no contact — MCU dominates at ~50 mA, LEDs ~7 mA):
+  10,000 mAh bank              ~113 hours / 4.7 days
+  20,000 mAh bank              ~226 hours / 9.4 days
+
+Active sessions (3 min, ~300 mA average):
+  Energy per session           ~75 mWh
+  10 sessions (30 min)         ~0.75 Wh
+  20 sessions (1 hr)           ~1.5 Wh
+  100 sessions (5 hr)          ~7.5 Wh
+
+Brightness vs power (LED draw only — MCU/sensor ~58 mA baseline unchanged):
+
+  BRIGHTNESS   PULSE peak   SYNC peak    Cap hit?
+  100          ~350 mA      ~700 mA      No
+  150          ~525 mA      ~1050 mA     Occasionally
+  200          ~700 mA      ~1400 mA     Often
+  255          ~893 mA      ~1780 mA     Yes — FastLED silently dims output
+
+  Sweet spot: BRIGHTNESS 150–180 for noticeably more output without hitting the cap.
+  To raise the cap: set MAX_MILLIAMPS = NUM_LEDS * 40 (2400 mA) with a 5V 3A supply.
+
 * Future AC installation power option
 
 ---
@@ -173,14 +202,18 @@ Training loop: if a participant shifts their finger and loses signal, the strip 
 
 Key Tunable Constants (include/led_controller.h)
 
-NUM_LEDS              20 (dev) / 60 (production)    Change this only — everything else scales automatically
-BRIGHTNESS            100                            0–255 global FastLED brightness
-MAX_MILLIAMPS         NUM_LEDS × 25                  Auto-scales: 500 mA @ 20 LEDs, 1500 mA @ 60 LEDs
-GATHER_LEDS_PER_BEAT  NUM_LEDS / 6                   Starting floor in GATHER; 3 @ 20 LEDs, 10 @ 60 LEDs
-GATHER_BEAT_TOTAL     4                              Must match BPM_HISTORY_SIZE; used for proportional fill mapping
-CONNECTING_FILL_MS    2500                           Rise speed for final fill to full strip on BPM lock (ms)
+NUM_LEDS              60                             Total LEDs; each sensor owns half (30 LEDs)
+BRIGHTNESS            100                            0–255 global FastLED brightness; see power table above
+MAX_MILLIAMPS         NUM_LEDS × 25 = 1500 mA        FastLED power cap; raise to NUM_LEDS × 40 with a 3A supply
+CONNECTING_FILL_MS    2500                           Rise speed for final fill on BPM lock (ms)
 CONNECTING_HOLD_MS    500                            Hold duration in HOLD phase before PULSE (ms)
-DRAIN_MS              800                            Duration of right-to-left wipe on contact loss (ms)
+DRAIN_MS              800                            Duration of edge-to-centre wipe on contact loss (ms)
+
+Internal constants (src/led_controller.cpp — not in header)
+
+HALF_LEDS             NUM_LEDS / 2 = 30              LEDs per sensor half
+HALF_GATHER_INIT      HALF_LEDS / 6 = 5              Starting floor in GATHER per half
+GATHER_BEAT_TOTAL     4                              Must match BPM_HISTORY_SIZE; maps beat fraction → fill fraction
 
 Key Tunable Constants (src/heartbeat.cpp)
 
@@ -242,12 +275,12 @@ Phase 2 — In Progress
 * GATHER: 3-LED VU meter bounce while waiting for next beat ✓
 * SYNC: ~28-second artistic sequence (pulses → wipe → colour shift → storm → zaps → glow → fade) ✓
 * SYNC: triggerable via serial 's'/'S', cancelable by typing again ✓
-* Second heartbeat sensor (Person B) — pending wiring
-* Split strip — LED 0 and LED 59 at heart base; Person A from LED 0, Person B from LED 59 inward
-* Serial output in two columns (Person A left, Person B right) — pending second sensor
-* Dual pulse animation — pulses travelling toward each other from each end
-* Sync detection — compare BPMs between participants
-* Sync bloom — trigger SYNC sequence when both sensors confirm alignment
+* Second heartbeat sensor (Person B on D8) ✓
+* Split strip — Sensor A drives LEDs 0–29, Sensor B drives LEDs 59–30 (reversed); each half independent ✓
+* Serial output in two columns (Sensor A left, Sensor B right) ✓
+* Dual pulse animation — pulses travelling from each person's end toward centre ✓
+* Sync detection — auto-triggers when both BPMs are within 10 BPM of each other ✓
+* Sync bloom — warm gold bloom at centre when sync is possible ✓
 
 Phase 3
 
@@ -281,7 +314,12 @@ Signal       D3 (Analog)
 VCC          3.3V
 GND          GND
 
-Second sensor (Person B) — pin TBD when wiring added.
+Sensor B (Person B)
+
+Sensor       ESP32
+Signal       D8 (Analog, ADC1_6)
+VCC          3.3V
+GND          GND
 
 ---
 

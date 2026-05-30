@@ -2,124 +2,329 @@
 #include <Arduino.h>
 #include <PulseSensorPlayground.h>
 
-// Pulse sensor input pin on the ESP32.
-static const int PulseWire = D3;
+// ── Configuration ──────────────────────────────────────────────────────────────
 
-// Beat detection threshold for the 12-bit ADC (range 0–4095).
-// Raise if you get false beats (noise). Lower if real beats are missed.
-// Start at 1930 and adjust in steps of 50 while watching serial output.
-static const int Threshold = 1930;
+static const int   THRESHOLD                   = 1930;
+static const int   CONTACT_WINDOW              = 40;   // 40 × 10 ms = 400 ms window
+static const int   CONTACT_MIN_RANGE           = 200;
+static const float CONTACT_DEVIATION_THRESHOLD = 200.0f;
+static const int   MIN_ACCEPTABLE_IBI_MS       = 428;  // 140 BPM max
+static const int   MAX_ACCEPTABLE_IBI_MS       = 1500; // 40 BPM min
+static const int   BPM_HISTORY_SIZE            = 4;
+static const unsigned long CONTACT_HOLD_MS       = 2500;
+static const unsigned long CONTACT_CONFIRM_MS    = 2000;
+static const unsigned long BPM_RESET_TIMEOUT_MS  = 8000;
+static const unsigned long BEAT_DECAY_MS         = 600;
+static const unsigned long PRINT_INTERVAL_MS     = 500;
 
-// LED used by PulseSensorPlayground to blink on each beat.
-static const int PulseLed = LED_BUILTIN;
-
-// ANSI color codes for serial monitor output.
 static const char* COLOR_RESET  = "\x1b[0m";
 static const char* COLOR_RED    = "\x1b[31m";
 static const char* COLOR_GREEN  = "\x1b[32m";
-static const char* COLOR_YELLOW = "\x1b[33m";
 static const char* COLOR_ORANGE = "\x1b[38;5;208m";
 
-// Library object used to interact with PulseSensorPlayground.
-static PulseSensorPlayground pulseSensor;
+static PulseSensorPlayground pulseSensor(2);
 
-// Print status every 500ms for easier readability.
-static const unsigned long RAW_PRINT_INTERVAL_MS = 500;
-static unsigned long lastRawPrint = 0;
+// Visible width of one column ("GOOD | RAW:1845 | RNG: 350 | BPM: 72" = 36)
+// plus the 4-space separator — B events indent by this many chars to align right.
+static const int B_COL_INDENT = 40;
 
-// Rolling signal window for contact quality — checks how much the signal swings over ~400ms.
-// A floating/idle sensor sits flat; a real heartbeat produces visible variation.
-static const int CONTACT_WINDOW = 40;       // 40 samples × 10ms loop = 400ms
-static const int CONTACT_MIN_RANGE = 200;         // ADC counts of swing required to count as contact. Raise if false GOOD in bright/noisy rooms. Lower if real beats are missed.
-static const float CONTACT_DEVIATION_THRESHOLD = 200.0f; // ADC counts shift from idle baseline that also counts as contact. Fires immediately on touch without waiting for variance to build up.
-static float rawBaseline = 2048.0f; // Slow EMA of the idle (no-finger) RAW level — self-calibrates to any room.
-static int contactSamples[CONTACT_WINDOW];
-static int contactIdx = 0;
-static bool contactWindowFull = false;
+// ── Per-sensor state ───────────────────────────────────────────────────────────
 
-// Minimum and maximum accepted beat interval.
-// This prevents fast false beats from showing as high BPM.
-static const int MIN_ACCEPTABLE_IBI_MS = 428;   // 140 BPM max // 500 is 120 BP Max
-static const int MAX_ACCEPTABLE_IBI_MS = 1500;  // 40 BPM min
+struct SensorState {
+    int  pin;
+    int  idx;
 
-// Rolling BPM average — requires this many consecutive valid beats before
-// reporting a stable BPM. Raise to be more conservative, lower to respond faster.
-static const int BPM_HISTORY_SIZE = 4;   // Valid beats needed before reporting stable BPM. Lower = faster response, higher = more stable.
-static int bpmHistory[BPM_HISTORY_SIZE] = {0};
-static int bpmHistoryIndex = 0;
-static int bpmHistoryCount = 0;
+    int   samples[CONTACT_WINDOW];
+    int   sampleIdx;
+    bool  windowFull;
+    float rawBaseline;
 
-// If no valid beat arrives within this window, reset the average (contact lost).
-static const unsigned long BPM_RESET_TIMEOUT_MS = 8000;
-static unsigned long lastValidBeatTime = 0;
+    bool          lastContactGood;
+    unsigned long lastContactGoodTime;
+    unsigned long contactStartMs;
+    bool          prevContactGood;
+    unsigned long startupProtectUntil;
 
-// Brightness decay after each beat — flash lasts this many ms then fades to 0.
-static const unsigned long BEAT_DECAY_MS = 600;
-static unsigned long lastBeatMs = 0;
-static uint8_t beatPeak = 0;
+    int           nearZeroStreak;
+    bool          possibleActive;
+    unsigned long possibleUntilMs;
 
-// Exposed contact state for LED transitions.
-static bool lastContactGood = false;
+    int           bpmHistory[BPM_HISTORY_SIZE];
+    int           bpmHistoryIdx;
+    int           bpmHistoryCount;
+    unsigned long lastValidBeatTime;
 
-// Set true for one frame when a valid beat is confirmed. Read via getJustBeat().
-static bool justBeatFlag = false;
+    unsigned long lastBeatMs;
+    uint8_t       beatPeak;
+    bool          justBeatFlag;
 
-// Possible-contact hint — fires on 2nd consecutive near-zero raw sample to avoid transients.
-static int           rawNearZeroStreak      = 0;
-static bool          possibleContactActive  = false;
-static unsigned long possibleContactUntilMs = 0;
+    // print cache — filled each processSensor call, consumed by printColumns
+    bool printContactGood;
+    int  printRaw;
+    int  printRange;
+    int  printBpm;   // -1 = no valid reading
+};
 
-// How long to hold "contact good" after signal goes POOR — absorbs finger shifts.
-// Raise if transitions to purple feel too trigger-happy. Lower if you want faster response.
-static const unsigned long CONTACT_HOLD_MS = 2500;
-static unsigned long lastContactGoodTime = 0;
+static SensorState sA, sB;
+static unsigned long lastPrintMs = 0;
 
-// How long contact must be held before the strip commits to sensing state (red + pulses).
-// Prevents false positives from triggering colour changes. Adjust to taste.
-static const unsigned long CONTACT_CONFIRM_MS = 2000;
-static unsigned long contactStartMs = 0;
-static bool prevContactGood = false;
+// ── State helpers ──────────────────────────────────────────────────────────────
 
-// Calibration routine — triggered via 'c' in the serial monitor, or called from setupHeartbeat().
-// Phase 1: one no-finger baseline (noise floor).
-// Phase 2: NUM_CAL_ROUNDS with-finger samples — lift and replace between each for variability.
-// Recommends CONTACT_MIN_RANGE as the midpoint between noise ceiling and worst finger minimum.
-void runCalibration() {
-    const int  NUM_CAL_ROUNDS    = 3;
-    const int  SAMPLE_INTERVAL   = 10;
-    const int  BASELINE_DURATION = 5000;
-    const int  FINGER_DURATION   = 4000;
-    const int  PRINT_INTERVAL    = 500;
+static bool cGoodFor(const SensorState& s, unsigned long now) {
+    return s.lastContactGood ||
+           (s.lastContactGoodTime != 0 && now - s.lastContactGoodTime < CONTACT_HOLD_MS);
+}
 
-    static int calSamples[CONTACT_WINDOW];
+static bool cConfFor(const SensorState& s, unsigned long now) {
+    return cGoodFor(s, now) && s.contactStartMs != 0 &&
+           (now - s.contactStartMs >= CONTACT_CONFIRM_MS);
+}
 
-    auto sampleRange = [&](int durationMs, int* outMin, int* outMax, bool showCountdown = false) {
-        int calIdx = 0;
-        for (int i = 0; i < CONTACT_WINDOW; i++) {
-            calSamples[i] = analogRead(PulseWire);
-            delay(SAMPLE_INTERVAL);
+static int stableBPMFor(SensorState& s, unsigned long now) {
+    if (s.bpmHistoryCount < BPM_HISTORY_SIZE) return 0;
+    if (now - s.lastValidBeatTime > BPM_RESET_TIMEOUT_MS) {
+        s.bpmHistoryCount = 0;
+        return 0;
+    }
+    int sum = 0;
+    for (int i = 0; i < BPM_HISTORY_SIZE; i++) sum += s.bpmHistory[i];
+    return sum / BPM_HISTORY_SIZE;
+}
+
+// ── Column printing ────────────────────────────────────────────────────────────
+// Called after sensor B is processed so both caches are fresh.
+// GOOD and POOR are the same byte length with ANSI codes, so columns align.
+
+static void printColumns(unsigned long now) {
+    if (now - lastPrintMs < PRINT_INTERVAL_MS) return;
+    lastPrintMs = now;
+
+    auto fmtCol = [](const SensorState& s) -> String {
+        char buf[64];
+        const char* clr = s.printContactGood ? COLOR_GREEN : COLOR_RED;
+        const char* lbl = s.printContactGood ? "GOOD" : "POOR";
+        if (s.printBpm >= 0)
+            snprintf(buf, sizeof(buf), "%s%s%s | RAW:%4d | RNG:%4d | BPM:%3d",
+                     clr, lbl, COLOR_RESET, s.printRaw, s.printRange, s.printBpm);
+        else
+            snprintf(buf, sizeof(buf), "%s%s%s | RAW:%4d | RNG:%4d | BPM:---",
+                     clr, lbl, COLOR_RESET, s.printRaw, s.printRange);
+        return String(buf);
+    };
+
+    Serial.print(fmtCol(sA));
+    Serial.print("    ");
+    Serial.println(fmtCol(sB));
+}
+
+// ── Core processing ────────────────────────────────────────────────────────────
+
+static uint8_t processSensor(SensorState& s, unsigned long now) {
+    int rawSample = pulseSensor.getLatestSample(s.idx);
+
+    // Near-zero hint: first-touch signature, require 2 consecutive samples
+    if (rawSample < 50) {
+        if (++s.nearZeroStreak == 2) {
+            s.possibleActive  = true;
+            s.possibleUntilMs = now + 4000;
+            const char* pin = (s.idx == 0) ? "D3" : "D8";
+            if (s.idx == 0)
+                Serial.printf("%s👆🏼 Possible contact [%s]%s\n", COLOR_ORANGE, pin, COLOR_RESET);
+            else
+                Serial.printf("%*s%s👆🏼 Possible contact [%s]%s\n",
+                              B_COL_INDENT, "", COLOR_ORANGE, pin, COLOR_RESET);
         }
-        int rMin = 4095, rMax = 0;
-        unsigned long end      = millis() + durationMs;
-        unsigned long warmupEnd = millis() + 1000; // skip first 1s — ring buffer needs to fill with real data before rMin is meaningful
-        unsigned long nextPrint = millis();
-        while (millis() < end) {
-            int raw = analogRead(PulseWire);
-            calSamples[calIdx] = raw;
-            calIdx = (calIdx + 1) % CONTACT_WINDOW;
-            int cMin = calSamples[0], cMax = calSamples[0];
-            for (int i = 1; i < CONTACT_WINDOW; i++) {
-                if (calSamples[i] < cMin) cMin = calSamples[i];
-                if (calSamples[i] > cMax) cMax = calSamples[i];
+    } else {
+        s.nearZeroStreak = 0;
+    }
+
+    bool justBeat = pulseSensor.sawStartOfBeat(s.idx);
+    int  myBPM    = pulseSensor.getBeatsPerMinute(s.idx);
+    int  ibi      = pulseSensor.getInterBeatIntervalMs(s.idx);
+    bool bpmOK    = (ibi >= MIN_ACCEPTABLE_IBI_MS && ibi <= MAX_ACCEPTABLE_IBI_MS);
+
+    // Rolling contact window — min/max range over ~400 ms
+    s.samples[s.sampleIdx] = rawSample;
+    s.sampleIdx = (s.sampleIdx + 1) % CONTACT_WINDOW;
+    if (s.sampleIdx == 0) s.windowFull = true;
+
+    int cMin = s.samples[0], cMax = s.samples[0];
+    int wSize = s.windowFull ? CONTACT_WINDOW : (s.sampleIdx > 0 ? s.sampleIdx : 1);
+    for (int i = 1; i < wSize; i++) {
+        if (s.samples[i] < cMin) cMin = s.samples[i];
+        if (s.samples[i] > cMax) cMax = s.samples[i];
+    }
+    int   range     = cMax - cMin;
+    float deviation = fabsf((float)rawSample - s.rawBaseline);
+
+    bool signalIdle = (rawSample > 400) && (range < CONTACT_MIN_RANGE / 2);
+    if (signalIdle) s.rawBaseline = s.rawBaseline * 0.99f + (float)rawSample * 0.01f;
+
+    bool contactGood = (rawSample > 400 && rawSample < 3700) &&
+                       (range >= CONTACT_MIN_RANGE || deviation >= CONTACT_DEVIATION_THRESHOLD);
+
+    if (s.startupProtectUntil == 0) s.startupProtectUntil = now + 2500;
+    if (now < s.startupProtectUntil) contactGood = false;
+
+    if (contactGood && !s.prevContactGood && s.contactStartMs == 0)
+        s.contactStartMs = now;
+    if (!contactGood && now - s.lastContactGoodTime >= CONTACT_HOLD_MS)
+        s.contactStartMs = 0;
+
+    s.prevContactGood = contactGood;
+    s.lastContactGood = contactGood;
+    if (contactGood) s.lastContactGoodTime = now;
+
+    bool cGood = cGoodFor(s, now);
+    bool cConf = cConfFor(s, now);
+
+    // Update print cache
+    s.printContactGood = contactGood;
+    s.printRaw         = rawSample;
+    s.printRange       = range;
+    s.printBpm         = (cGood && bpmOK && myBPM > 0) ? myBPM : -1;
+
+    // Beat processing — only when contact is confirmed
+    if (justBeat && cConf) {
+        if (bpmOK) {
+            s.bpmHistory[s.bpmHistoryIdx] = myBPM;
+            s.bpmHistoryIdx = (s.bpmHistoryIdx + 1) % BPM_HISTORY_SIZE;
+            if (s.bpmHistoryCount < BPM_HISTORY_SIZE) s.bpmHistoryCount++;
+            s.lastValidBeatTime = now;
+            s.justBeatFlag      = true;
+            s.lastBeatMs        = now;
+            s.beatPeak          = 220;
+
+            int stable = stableBPMFor(s, now);
+            Serial.print(COLOR_RED);
+            if (s.idx == 0) {
+                if (stable > 0)
+                    Serial.printf("♥  BPM:%3d | Stable:%3d\n", myBPM, stable);
+                else
+                    Serial.printf("♥  BPM:%3d | Gathering beats (%d/%d)\n",
+                                  myBPM, s.bpmHistoryCount, BPM_HISTORY_SIZE);
+            } else {
+                if (stable > 0)
+                    Serial.printf("%*s♥  BPM:%3d | Stable:%3d\n",
+                                  B_COL_INDENT, "", myBPM, stable);
+                else
+                    Serial.printf("%*s♥  BPM:%3d | Gathering beats (%d/%d)\n",
+                                  B_COL_INDENT, "", myBPM,
+                                  s.bpmHistoryCount, BPM_HISTORY_SIZE);
             }
-            int range = cMax - cMin;
-            if (millis() >= warmupEnd && range < rMin) rMin = range; // only track rMin after warmup
-            if (range > rMax) rMax = range;
+            Serial.print(COLOR_RESET);
+        } else {
+            if (s.idx == 0)
+                Serial.printf("⚠️  Beat ignored | IBI:%dms\n", ibi);
+            else
+                Serial.printf("%*s⚠️  Beat ignored | IBI:%dms\n",
+                              B_COL_INDENT, "", ibi);
+        }
+    }
+
+    if (!cConf) { s.beatPeak = 0; s.justBeatFlag = false; }
+    if (!cGood)   s.bpmHistoryCount = 0;
+    if (s.possibleActive && now > s.possibleUntilMs && !cGood) s.possibleActive = false;
+
+    // Quadratic decay brightness
+    uint8_t pulse = 0;
+    unsigned long beatElapsed = now - s.lastBeatMs;
+    if (beatElapsed < BEAT_DECAY_MS) {
+        uint32_t rem = BEAT_DECAY_MS - beatElapsed;
+        pulse = (uint32_t)s.beatPeak * rem * rem /
+                ((uint32_t)BEAT_DECAY_MS * BEAT_DECAY_MS);
+    }
+    return pulse;
+}
+
+// ── Public API — sensor A ──────────────────────────────────────────────────────
+
+uint8_t heartbeatBrightness()  { return processSensor(sA, millis()); }
+bool    getContactGood()       { return cGoodFor(sA, millis()); }
+bool    isContactConfirmed()   { return cConfFor(sA, millis()); }
+bool    isPossibleContact()    { return sA.possibleActive; }
+bool    getJustBeat()          { bool r = sA.justBeatFlag; sA.justBeatFlag = false; return r; }
+int     getValidBeatCount()    { return sA.bpmHistoryCount; }
+int     getStableBPM()         { return stableBPMFor(sA, millis()); }
+
+// ── Public API — sensor B ──────────────────────────────────────────────────────
+// heartbeatBrightnessB() must be called each loop after heartbeatBrightness()
+// — it triggers the column print once both caches are populated.
+
+uint8_t heartbeatBrightnessB() {
+    unsigned long now = millis();
+    uint8_t pulse = processSensor(sB, now);
+    printColumns(now);
+    return pulse;
+}
+bool    getContactGoodB()      { return cGoodFor(sB, millis()); }
+bool    isContactConfirmedB()  { return cConfFor(sB, millis()); }
+bool    isPossibleContactB()   { return sB.possibleActive; }
+bool    getJustBeatB()         { bool r = sB.justBeatFlag; sB.justBeatFlag = false; return r; }
+int     getValidBeatCountB()   { return sB.bpmHistoryCount; }
+int     getStableBPMB()        { return stableBPMFor(sB, millis()); }
+
+void applyHeartbeatPulse(uint8_t pulse) {
+    nscale8_video(leds, NUM_LEDS, pulse);
+}
+
+// ── Setup ──────────────────────────────────────────────────────────────────────
+
+void setupHeartbeat() {
+    Serial.begin(115200);
+    delay(1000);
+    analogReadResolution(12);
+
+    memset(&sA, 0, sizeof(sA)); sA.pin = D3; sA.idx = 0; sA.rawBaseline = 2048.0f;
+    memset(&sB, 0, sizeof(sB)); sB.pin = D8; sB.idx = 1; sB.rawBaseline = 2048.0f;
+    for (int i = 0; i < CONTACT_WINDOW; i++) sA.samples[i] = sB.samples[i] = 2048;
+    sA.printBpm = sB.printBpm = -1;
+
+    pulseSensor.analogInput(D3, 0);
+    pulseSensor.analogInput(D8, 1);
+    pulseSensor.setThreshold(THRESHOLD, 0);
+    pulseSensor.setThreshold(THRESHOLD, 1);
+
+    if (pulseSensor.begin()) {
+        Serial.println("PulseSensor ready — A=D3, B=D8.");
+    } else {
+        Serial.println("PulseSensor failed to start.");
+    }
+}
+
+// ── Calibration (D3 + D8) ──────────────────────────────────────────────────────
+
+void runCalibration() {
+    const int NUM_CAL_ROUNDS    = 2;
+    const int SAMPLE_INTERVAL   = 10;
+    const int BASELINE_DURATION = 3000;
+    const int FINGER_DURATION   = 2500;
+    const int PRINT_INTERVAL    = 500;
+
+    static int bufA[CONTACT_WINDOW], bufB[CONTACT_WINDOW];
+
+    // Sample one pin into a rolling window; return min and max range seen.
+    auto sampleOne = [&](int pin, int* buf, int durationMs,
+                         int* outMin, int* outMax, bool countdown = false) {
+        for (int i = 0; i < CONTACT_WINDOW; i++) { buf[i] = analogRead(pin); delay(SAMPLE_INTERVAL); }
+        int idx = 0, rMin = 4095, rMax = 0;
+        unsigned long end = millis() + durationMs, warmup = millis() + 1000, nextPrint = millis();
+        while (millis() < end) {
+            int raw = analogRead(pin);
+            buf[idx] = raw; idx = (idx + 1) % CONTACT_WINDOW;
+            int cMin = buf[0], cMax = buf[0];
+            for (int i = 1; i < CONTACT_WINDOW; i++) {
+                if (buf[i] < cMin) cMin = buf[i];
+                if (buf[i] > cMax) cMax = buf[i];
+            }
+            int r = cMax - cMin;
+            if (millis() >= warmup && r < rMin) rMin = r;
+            if (r > rMax) rMax = r;
             if (millis() >= nextPrint) {
-                Serial.printf("  RAW: %4d | RANGE: %4d", raw, range);
-                if (showCountdown) {
+                Serial.printf("  RAW:%4d | RNG:%4d", raw, r);
+                if (countdown) {
                     unsigned long rem = (end > millis()) ? end - millis() : 0;
-                    Serial.printf(" | lift in %d.%ds", (int)(rem / 1000), (int)((rem % 1000) / 100));
+                    Serial.printf(" | lift in %d.%ds", (int)(rem/1000), (int)((rem%1000)/100));
                 }
                 Serial.println();
                 nextPrint += PRINT_INTERVAL;
@@ -130,312 +335,92 @@ void runCalibration() {
         if (outMax) *outMax = rMax;
     };
 
-    Serial.println();
-    Serial.println("=== CONTACT CALIBRATION ===");
-    Serial.print("Rounds: "); Serial.println(NUM_CAL_ROUNDS);
-    Serial.println();
-
-    // ── Phase 1: noise floor (once) ──────────────────────────────────────────
-    Serial.println("PHASE 1 — Keep finger OFF. Measuring noise floor.");
-    for (int i = 3; i >= 1; i--) {
-        Serial.print("  "); Serial.print(i); Serial.println("...");
-        delay(1000);
-    }
-    int noFingerMax = 0;
-    sampleRange(BASELINE_DURATION, nullptr, &noFingerMax);
-    Serial.print("Noise floor max RANGE: "); Serial.println(noFingerMax);
-    Serial.println();
-
-    // ── Phase 2: with-finger, NUM_CAL_ROUNDS rounds ──────────────────────────
-    int roundMin[NUM_CAL_ROUNDS], roundMax[NUM_CAL_ROUNDS];
-
-    for (int r = 0; r < NUM_CAL_ROUNDS; r++) {
-        Serial.print("ROUND "); Serial.print(r + 1);
-        Serial.print("/"); Serial.print(NUM_CAL_ROUNDS);
-        Serial.println(" — Place finger firmly on sensor.");
-        for (int i = 3; i >= 1; i--) {
-            Serial.print("  "); Serial.print(i); Serial.println("...");
-            delay(1000);
+    // Sample both pins simultaneously and print in columns.
+    auto sampleBoth = [&](int durationMs, int* outMaxA, int* outMaxB) {
+        for (int i = 0; i < CONTACT_WINDOW; i++) {
+            bufA[i] = analogRead(D3); bufB[i] = analogRead(D8); delay(SAMPLE_INTERVAL);
         }
-        Serial.println("  Sampling...");
-        sampleRange(FINGER_DURATION, &roundMin[r], &roundMax[r], true);
-        Serial.print("  Round "); Serial.print(r + 1);
-        Serial.print(" RANGE: "); Serial.print(roundMin[r]);
-        Serial.print(" – "); Serial.println(roundMax[r]);
+        int iA = 0, iB = 0, rMaxA = 0, rMaxB = 0;
+        unsigned long end = millis() + durationMs, nextPrint = millis();
+        while (millis() < end) {
+            int rawA = analogRead(D3), rawB = analogRead(D8);
+            bufA[iA] = rawA; iA = (iA + 1) % CONTACT_WINDOW;
+            bufB[iB] = rawB; iB = (iB + 1) % CONTACT_WINDOW;
+            int cMinA = bufA[0], cMaxA = bufA[0], cMinB = bufB[0], cMaxB = bufB[0];
+            for (int i = 1; i < CONTACT_WINDOW; i++) {
+                if (bufA[i] < cMinA) cMinA = bufA[i]; if (bufA[i] > cMaxA) cMaxA = bufA[i];
+                if (bufB[i] < cMinB) cMinB = bufB[i]; if (bufB[i] > cMaxB) cMaxB = bufB[i];
+            }
+            int rA = cMaxA - cMinA, rB = cMaxB - cMinB;
+            if (rA > rMaxA) rMaxA = rA;
+            if (rB > rMaxB) rMaxB = rB;
+            if (millis() >= nextPrint) {
+                Serial.printf("  D3 RAW:%4d RNG:%4d    D8 RAW:%4d RNG:%4d\n",
+                              rawA, rA, rawB, rB);
+                nextPrint += PRINT_INTERVAL;
+            }
+            delay(SAMPLE_INTERVAL);
+        }
+        if (outMaxA) *outMaxA = rMaxA;
+        if (outMaxB) *outMaxB = rMaxB;
+    };
 
+    auto printResult = [&](const char* pin, int noiseMax, int* rMin, int* rMax) {
+        Serial.printf("  %s  noise <= %d", pin, noiseMax);
+        int bestMax = 0;
+        for (int r = 0; r < NUM_CAL_ROUNDS; r++) {
+            Serial.printf("  |  round %d: %d–%d", r+1, rMin[r], rMax[r]);
+            if (rMax[r] > bestMax) bestMax = rMax[r];
+        }
+        int rec = noiseMax + 50;
+        if (bestMax > noiseMax * 2)
+            Serial.printf("  →  CONTACT_MIN_RANGE = %d\n", rec);
+        else
+            Serial.printf("  →  WARNING: signal weak (current %d)\n", CONTACT_MIN_RANGE);
+    };
+
+    Serial.println("\n=== CALIBRATION (D3 + D8) ===");
+
+    // ── Phase 1: noise floor — both sensors, no finger ─────────────────────────
+    Serial.println("PHASE 1 — Keep both fingers OFF.");
+    for (int i = 2; i >= 1; i--) { Serial.printf("  %d...\n", i); delay(1000); }
+    int nfA = 0, nfB = 0;
+    sampleBoth(BASELINE_DURATION, &nfA, &nfB);
+    Serial.printf("Noise floor — D3: %d  D8: %d\n\n", nfA, nfB);
+
+    // ── Phase 2: sensor A (D3) finger rounds ───────────────────────────────────
+    int minA[NUM_CAL_ROUNDS], maxA[NUM_CAL_ROUNDS];
+    Serial.println("── D3 (Sensor A) ──");
+    for (int r = 0; r < NUM_CAL_ROUNDS; r++) {
+        Serial.printf("Round %d/%d — finger on D3.\n", r+1, NUM_CAL_ROUNDS);
+        for (int i = 2; i >= 1; i--) { Serial.printf("  %d...\n", i); delay(1000); }
+        sampleOne(D3, bufA, FINGER_DURATION, &minA[r], &maxA[r], true);
+        Serial.printf("  Round %d RANGE: %d – %d\n", r+1, minA[r], maxA[r]);
         if (r < NUM_CAL_ROUNDS - 1) {
-            Serial.println("  Lift finger. Next round in:");
-            for (int i = 3; i >= 1; i--) {
-                Serial.print("  "); Serial.print(i); Serial.println("...");
-                delay(1000);
-            }
+            Serial.println("  Lift. Next in:");
+            for (int i = 2; i >= 1; i--) { Serial.printf("  %d...\n", i); delay(1000); }
         }
     }
 
-    // ── Summary ──────────────────────────────────────────────────────────────
-    Serial.println();
-    Serial.println("=== CALIBRATION RESULT ===");
-    Serial.print("Noise floor:  RANGE <= "); Serial.println(noFingerMax);
-
-    int worstFingerMin = 4095;
-    int bestFingerMax  = 0;
+    // ── Phase 3: sensor B (D8) finger rounds ───────────────────────────────────
+    int minB[NUM_CAL_ROUNDS], maxB[NUM_CAL_ROUNDS];
+    Serial.println("\n── D8 (Sensor B) ──");
     for (int r = 0; r < NUM_CAL_ROUNDS; r++) {
-        Serial.print("Round "); Serial.print(r + 1);
-        Serial.print(":  finger RANGE "); Serial.print(roundMin[r]);
-        Serial.print(" – "); Serial.println(roundMax[r]);
-        if (roundMin[r] < worstFingerMin) worstFingerMin = roundMin[r];
-        if (roundMax[r] > bestFingerMax)  bestFingerMax  = roundMax[r];
-    }
-
-    Serial.println();
-    // Recommend noise floor + 50-count margin. Heartbeat peaks far exceed this;
-    // between-beat valleys rely on the DEV threshold instead.
-    int recommended = noFingerMax + 50;
-    if (bestFingerMax > noFingerMax * 2) {
-        Serial.print("Recommended CONTACT_MIN_RANGE = "); Serial.println(recommended);
-        Serial.println("Update heartbeat.cpp and recompile.");
-        if (worstFingerMin < noFingerMax) {
-            Serial.println("Note: signal dips below noise between beats — normal.");
-            Serial.println("DEV threshold handles detection during those valleys.");
-        }
-    } else {
-        Serial.println("WARNING: signal barely above noise floor.");
-        Serial.println("Press more firmly, or shield the sensor from ambient light.");
-        Serial.print("Current CONTACT_MIN_RANGE = "); Serial.println(CONTACT_MIN_RANGE);
-    }
-    Serial.println("==========================");
-    Serial.println("Press 'c' to run again.");
-    Serial.println();
-}
-
-void setupHeartbeat() {
-    // Start serial output for debugging and monitoring.
-    Serial.begin(115200);
-    delay(1000);
-
-    // Set ESP32 ADC resolution to 12 bits.
-    analogReadResolution(12);
-
-    // Pre-fill contact window with midpoint so range starts at 0 (POOR) until real data arrives.
-    for (int i = 0; i < CONTACT_WINDOW; i++) contactSamples[i] = 2048;
-
-    // Configure the pulse sensor input and blink LED behavior.
-    pulseSensor.analogInput(PulseWire);
-    // pulseSensor.blinkOnPulse(PulseLed); // disabled — timer ISR toggling a pin can cause marginal WS2812B signal corruption
-    pulseSensor.setThreshold(Threshold);
-
-    // Initialize the library and confirm startup.
-    if (pulseSensor.begin()) {
-        Serial.println("We created a pulseSensor Object !");
-    } else {
-        Serial.println("PulseSensor failed to start.");
-    }
-
-    // Uncomment to run calibration on boot instead of using the 'c' key trigger.
-    // runCalibration();
-}
-
-bool getContactGood() {
-    return lastContactGood || (lastContactGoodTime != 0 && millis() - lastContactGoodTime < CONTACT_HOLD_MS);
-}
-
-// True only after contact has been held continuously for CONTACT_CONFIRM_MS.
-// Use this to gate visual state changes — prevents false positives lighting up the strip.
-bool isContactConfirmed() {
-    if (!getContactGood()) return false;
-
-    // No real contact has started yet.
-    // Prevents millis() - 0 from instantly confirming after boot.
-    if (contactStartMs == 0) return false;
-
-    return millis() - contactStartMs >= CONTACT_CONFIRM_MS;
-}
-
-int getValidBeatCount() { return bpmHistoryCount; }
-
-bool isPossibleContact() { return possibleContactActive; }
-
-// Returns true exactly once per valid beat, then resets. Use to trigger pulse spawning.
-bool getJustBeat() {
-    bool result = justBeatFlag;
-    justBeatFlag = false;
-    return result;
-}
-// Returns the averaged BPM once enough consecutive valid beats are collected.
-// Returns 0 if still warming up or if contact has been lost.
-int getStableBPM() {
-    if (bpmHistoryCount < BPM_HISTORY_SIZE) return 0;
-    if (millis() - lastValidBeatTime > BPM_RESET_TIMEOUT_MS) {
-        bpmHistoryCount = 0;
-        return 0;
-    }
-    int sum = 0;
-    for (int i = 0; i < BPM_HISTORY_SIZE; i++) sum += bpmHistory[i];
-    return sum / BPM_HISTORY_SIZE;
-}
-
-uint8_t heartbeatBrightness() {
-    // Default: 0 lets main.cpp fall back to standby breathing glow.
-    uint8_t pulse = 0;
-
-    // Get the current timestamp and raw sample for diagnostics.
-    unsigned long now = millis();
-    int rawSample = pulseSensor.getLatestSample();
-
-    // First-touch signature: ADC reads near-zero when finger first makes contact.
-    // Require 2 consecutive samples to ignore single-sample transients.
-    bool rawNearZero = (rawSample < 50);
-    if (rawNearZero) {
-        rawNearZeroStreak++;
-        if (rawNearZeroStreak == 2) {
-            possibleContactActive  = true;
-            possibleContactUntilMs = now + 4000; // hold 4s — covers CONTACT_CONFIRM_MS + buffer
-            Serial.print(COLOR_ORANGE);
-            Serial.println("👆🏼 Possible contact detected... reading values");
-            Serial.print(COLOR_RESET);
-        }
-    } else {
-        rawNearZeroStreak = 0;
-    }
-
-    // Heartbeat state values from the PulseSensor library.
-    bool justBeat = pulseSensor.sawStartOfBeat();
-    bool insideBeat = pulseSensor.isInsideBeat();
-    int myBPM = pulseSensor.getBeatsPerMinute();
-    int interBeatInterval = pulseSensor.getInterBeatIntervalMs();
-    bool bpmReasonable = (interBeatInterval >= MIN_ACCEPTABLE_IBI_MS && interBeatInterval <=MAX_ACCEPTABLE_IBI_MS);
-
-    // Update rolling contact window and compute signal range.
-    contactSamples[contactIdx] = rawSample;
-    contactIdx = (contactIdx + 1) % CONTACT_WINDOW;
-    if (contactIdx == 0) contactWindowFull = true;
-
-    int cMin = contactSamples[0], cMax = contactSamples[0];
-    int windowSize = contactWindowFull ? CONTACT_WINDOW : contactIdx;
-    for (int i = 1; i < windowSize; i++) {
-        if (contactSamples[i] < cMin) cMin = contactSamples[i];
-        if (contactSamples[i] > cMax) cMax = contactSamples[i];
-    }
-    // Update the idle baseline only when the signal looks stable (low variance, raw in range).
-    // EMA time constant ~1s — adapts to room without tracking heartbeat pulses.
-    bool signalIdle = (rawSample > 400) && (cMax - cMin < CONTACT_MIN_RANGE / 2);
-    if (signalIdle) rawBaseline = rawBaseline * 0.99f + (float)rawSample * 0.01f;
-
-    // Contact good if: signal in range AND (variance high OR DC has shifted far from idle baseline).
-    // Deviation fires immediately on touch; variance confirms sustained contact.
-    float deviation = fabsf((float)rawSample - rawBaseline);
-    bool contactGood = (rawSample > 400 && rawSample < 3700) &&
-                       (cMax - cMin >= CONTACT_MIN_RANGE || deviation >= CONTACT_DEVIATION_THRESHOLD);
-
-    // Suppress contact for the first 1.5s of loop execution — sensor needs time to settle after power-on.
-    // Without this, startup transients can set contactStartMs and trigger a false confirmation 2s later.
-    static unsigned long startupProtectUntil = 0;
-    if (startupProtectUntil == 0) startupProtectUntil = now + 2500;
-    if (now < startupProtectUntil) contactGood = false;
-
-    // Start the confirmation timer only on a genuine rising edge — when contact was fully absent.
-    // The contactStartMs == 0 guard prevents brief signal dips (which happen naturally between
-    // heartbeat peaks) from restarting the timer. The hold timer handles those micro-drops.
-    if (contactGood && !prevContactGood && contactStartMs == 0) {
-        contactStartMs = now;
-    }
-    // Fully reset confirmation timing after contact has been gone longer than the hold window.
-    // Prevents stale timestamps from causing instant re-confirmation from sensor noise later.
-    if (!contactGood && millis() - lastContactGoodTime >= CONTACT_HOLD_MS) {
-        contactStartMs = 0;
-    }
-
-prevContactGood = contactGood;
-    
-    lastContactGood = contactGood;
-    if (contactGood) lastContactGoodTime = now;
-
-    if (now - lastRawPrint >= RAW_PRINT_INTERVAL_MS) {
-        Serial.print("CONTACT: ");
-        Serial.print(contactGood ? COLOR_GREEN : COLOR_RED);
-        Serial.print(contactGood ? "GOOD" : "POOR");
-        Serial.print(COLOR_RESET);
-        Serial.printf(" | RAW: %4d | RANGE: %4d | DEV: %4d | IBI: ",
-                      rawSample, cMax - cMin, (int)deviation);
-        if (bpmReasonable && myBPM > 0) Serial.printf("%4d", interBeatInterval);
-        else                            Serial.print(" ---");
-        Serial.print("ms | BPM: ");
-        if (bpmReasonable && myBPM > 0) Serial.printf("%3d", myBPM);
-        else                            Serial.print("---");
-        // Hold timer at end — doesn't affect column alignment of the fixed-width values.
-        bool holdActive = !contactGood && lastContactGoodTime != 0
-                          && (now - lastContactGoodTime) < CONTACT_HOLD_MS;
-        if (holdActive) {
-            unsigned long remaining = CONTACT_HOLD_MS - (now - lastContactGoodTime);
-            Serial.print(COLOR_YELLOW);
-            Serial.printf(" | hold %d.%ds",
-                          (int)(remaining / 1000UL), (int)((remaining % 1000) / 100));
-            Serial.print(COLOR_RESET);
-        }
-        Serial.println();
-        lastRawPrint = now;
-    }
-
-    // Only count beats when contact is confirmed — prevents noise and floating-pin false beats.
-    if (justBeat && isContactConfirmed()) {
-        if (bpmReasonable) {
-            bpmHistory[bpmHistoryIndex] = myBPM; // Add to rolling BPM history for averaging
-            bpmHistoryIndex = (bpmHistoryIndex + 1) % BPM_HISTORY_SIZE; 
-            if (bpmHistoryCount < BPM_HISTORY_SIZE) bpmHistoryCount++; // Track how many valid beats we've seen for stable BPM calculation
-            lastValidBeatTime = now;
-            justBeatFlag = true;
-
-            int stable = getStableBPM();
-            static int prevStableBpm = 0;
-            Serial.print(COLOR_RED);
-            Serial.printf("♥  Beat detected! | RAW: %4d | BPM: %3d", rawSample, myBPM);
-            if (stable > 0) {
-                Serial.printf(" | ♥ Stable BPM: %3d", stable);
-                if      (prevStableBpm > 0 && stable > prevStableBpm) Serial.print(" ⬆");
-                else if (prevStableBpm > 0 && stable < prevStableBpm) Serial.print(" ⬇");
-                prevStableBpm = stable;
-            } else {
-                Serial.printf(" | Gathering beats (%d/%d)", bpmHistoryCount, BPM_HISTORY_SIZE);
-            }
-            Serial.print(COLOR_RESET);
-            Serial.println();
-            lastBeatMs = now;
-            beatPeak = 220;
-        } else {
-            Serial.print("⚠️  Beat ignored | IBI: ");
-            Serial.print(interBeatInterval);
-            Serial.println("ms");
+        Serial.printf("Round %d/%d — finger on D8.\n", r+1, NUM_CAL_ROUNDS);
+        for (int i = 2; i >= 1; i--) { Serial.printf("  %d...\n", i); delay(1000); }
+        sampleOne(D8, bufB, FINGER_DURATION, &minB[r], &maxB[r], true);
+        Serial.printf("  Round %d RANGE: %d – %d\n", r+1, minB[r], maxB[r]);
+        if (r < NUM_CAL_ROUNDS - 1) {
+            Serial.println("  Lift. Next in:");
+            for (int i = 2; i >= 1; i--) { Serial.printf("  %d...\n", i); delay(1000); }
         }
     }
 
-    // Beat animation: clear on any confirmation drop to prevent phantom flashes.
-    if (!isContactConfirmed()) {
-        beatPeak = 0;
-        justBeatFlag = false;
-    }
-    // BPM history: only reset when contact is fully gone (hold timer expired).
-    // Keeping it alive through brief signal dips prevents heartbeatActive from flickering.
-    if (!getContactGood()) {
-        bpmHistoryCount = 0;
-    }
-
-    // Expire possible-contact hint once the hold window passes with no confirmed contact.
-    if (possibleContactActive && now > possibleContactUntilMs && !getContactGood()) {
-        possibleContactActive = false;
-    }
-
-    // Quadratic ease-out decay: drops fast then tapers — more like a real heartbeat pulse.
-    // At 50% through: 25% brightness. At 75%: 6%. Much smoother than linear.
-    unsigned long elapsed = now - lastBeatMs;
-    if (elapsed < BEAT_DECAY_MS) {
-        uint32_t remaining = BEAT_DECAY_MS - elapsed;
-        pulse = (uint32_t)beatPeak * remaining * remaining / ((uint32_t)BEAT_DECAY_MS * BEAT_DECAY_MS);
-    }
-
-    return pulse; // Return the current pulse brightness for this frame; 0 if no beat or after decay.
-}
-
-void applyHeartbeatPulse(uint8_t pulse) {
-    // Scale all LEDs by the current pulse brightness.
-    nscale8_video(leds, NUM_LEDS, pulse);
+    // ── Results ────────────────────────────────────────────────────────────────
+    Serial.println("\n=== RESULT ===");
+    printResult("D3:", nfA, minA, maxA);
+    printResult("D8:", nfB, minB, maxB);
+    Serial.println("==============");
+    Serial.println("Update CONTACT_MIN_RANGE in heartbeat.cpp and recompile.");
+    Serial.println("Press 'c' to run again.\n");
 }

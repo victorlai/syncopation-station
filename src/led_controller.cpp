@@ -11,330 +11,351 @@ void setupLedController() {
     FastLED.show();
 }
 
-// ── State ─────────────────────────────────────────────────────────────────────
+// ── Constants ──────────────────────────────────────────────────────────────────
 
-// Purple background level: 255 = full glow, 0 = black.
-static uint8_t bgLevel = 255;
+// Each sensor owns one half of the strip.
+// Sensor A: leds[0 .. HALF_LEDS-1] (left half, index 0 = strip start).
+// Sensor B: leds[NUM_LEDS-1 .. HALF_LEDS] reversed (right half, index 0 = strip end).
+constexpr int HALF_LEDS = NUM_LEDS / 2;   // 30
+
+// Starting fill when entering GATHER — 1/6 of a half so there's something to see immediately.
+constexpr uint8_t HALF_GATHER_INIT = HALF_LEDS / 6;  // 5
+
+// Must match BPM_HISTORY_SIZE in heartbeat.cpp. Maps beat fraction → half-strip fraction.
+constexpr uint8_t GATHER_BEAT_TOTAL = 4;
+
+// ── Per-half animation state ───────────────────────────────────────────────────
 
 enum AnimPhase : uint8_t {
-    PHASE_IDLE,      // red scanner — no contact
-    PHASE_POSSIBLE,  // 3 steady LEDs — raw near-zero detected, awaiting confirmation
-    PHASE_GATHER,    // beat-driven fill + pulse animation
-    PHASE_HOLD,      // all LEDs solid — brief hold before pulsing
-    PHASE_PULSE,     // beat-locked heartbeat pulsing, degrades when beats stop
-    PHASE_DRAIN,     // right-to-left wipe — contact lost during pulse/hold
-    PHASE_SYNC       // 15-second synchronized animation sequence
+    PHASE_IDLE,
+    PHASE_POSSIBLE,
+    PHASE_GATHER,
+    PHASE_HOLD,
+    PHASE_PULSE,
+    PHASE_DRAIN,
 };
-static AnimPhase     animPhase        = PHASE_IDLE;
-static unsigned long animPhaseStartMs = 0;
 
-// GATHER: smooth float so LEDs ease in rather than snapping.
-static float smoothLitLEDs = 0.0f;
+struct HalfAnim {
+    AnimPhase     animPhase;
+    unsigned long animPhaseStartMs;
+    uint8_t       bgLevel;
+    float         smoothLitLEDs;
+    uint8_t       prevBeatPulse;
+    uint32_t      animPeriodMs;
+    unsigned long animBeatMs;
+    uint16_t      drainLitAtStart;
+    int           prevBeatCount;
+    float         gatherFillLevel;
+    float         gatherPulsePos;
+    float         gatherPulseEnd;
+    bool          gatherPulseActive;
+};
 
-// PULSE: beat-locked animation state.
-static uint8_t       prevBeatPulse = 0;
-static uint32_t      animPeriodMs  = 857;   // smoothed inter-beat interval (~70 BPM default)
-static unsigned long animBeatMs    = 0;
+static HalfAnim hA = {};
+static HalfAnim hB = {};
 
-// DRAIN: how many LEDs were lit when the drain started (can be <NUM_LEDS if degraded).
-static uint16_t drainLitAtStart = NUM_LEDS;
+// ── Global sync override ───────────────────────────────────────────────────────
 
-// SYNC: start timestamp for the 15-second animation.
+static bool          syncActive  = false;
 static unsigned long syncStartMs = 0;
 
-// GATHER: per-beat 3-LED traveling pulse.
-static int   prevBeatCount     = 0;
-static float gatherFillLevel   = 0.0f;  // committed fill; stays put while pulse travels
-static float gatherPulsePos    = 0.0f;  // traveling pulse head (fractional LED index)
-static float gatherPulseEnd    = 0.0f;  // pulse destination
-static bool  gatherPulseActive = false;
+// ── Low-level helpers ─────────────────────────────────────────────────────────
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// Map half-local index → physical LED.
+// rev=false (A, left half):  px(false, i) = leds[i]
+// rev=true  (B, right half): px(true,  i) = leds[NUM_LEDS-1-i]
+static inline CRGB& px(bool rev, int i) {
+    return rev ? leds[NUM_LEDS - 1 - i] : leds[i];
+}
 
-// Render `litCount` red LEDs with a gradient (dim at index 0, bright at leading edge).
-// blinkLeading: last 3 positions animate as a bouncing VU meter (0→3→0 sine) while
-// the rest of the fill holds solid — signals "waiting for next beat".
-static void renderGatherLEDs(uint16_t litCount, bool blinkLeading = false) {
+static void fillHalf(bool rev, CRGB color) {
+    for (int i = 0; i < HALF_LEDS; i++) px(rev, i) = color;
+}
+
+// Render a graduated red fill within one half (index 0 = near edge, grows toward centre).
+// blinkLeading: last 3 positions animate as a VU meter — signals "waiting for next beat".
+static void renderHalfGather(bool rev, uint16_t litCount, bool blinkLeading = false) {
     uint16_t solidCount = (blinkLeading && litCount >= 3) ? litCount - 3 : litCount;
     uint8_t  meterLit   = blinkLeading ? beatsin8(70, 0, 3) : 0;
 
     static const uint8_t mbri[3] = { 100, 160, 220 };
 
-    for (uint16_t i = 0; i < NUM_LEDS; i++) {
-        if (i < solidCount) {
+    for (int i = 0; i < HALF_LEDS; i++) {
+        if ((uint16_t)i < solidCount) {
             uint8_t bright = (litCount > 1)
-                ? (uint8_t)map(i, 0, litCount - 1, 40, 180)
+                ? (uint8_t)map(i, 0, (int)(litCount - 1), 40, 180)
                 : 140;
-            leds[i] = CRGB(bright, 0, 0);
-        } else if (i < solidCount + meterLit) {
-            leds[i] = CRGB(mbri[i - solidCount], 0, 0);
+            px(rev, i) = CRGB(bright, 0, 0);
+        } else if ((uint16_t)i < solidCount + meterLit) {
+            px(rev, i) = CRGB(mbri[i - solidCount], 0, 0);
         } else {
-            leds[i] = CRGB::Black;
+            px(rev, i) = CRGB::Black;
         }
     }
 }
 
-static void renderSyncAnimation(uint32_t elapsed, uint8_t bpm);  // defined below drawFrame
+static void renderSyncAnimation(uint32_t elapsed, uint8_t bpm);   // defined below drawFrame
 
-// ── Main frame function ───────────────────────────────────────────────────────
-
-void drawFrame(bool possibleContact, bool contact, bool confirmed,
-               int beatCount, uint8_t bpm, uint8_t beatPulse) {
-
+// ── Per-half state machine + renderer ─────────────────────────────────────────
+//
+// rev=false → sensor A drives leds[0..HALF_LEDS-1].
+// rev=true  → sensor B drives leds[NUM_LEDS-1..HALF_LEDS] (reversed so index 0 is B's near end).
+//
+static void updateAndRenderHalf(HalfAnim& h, bool rev,
+    bool possibleContact, bool contact, bool confirmed,
+    int beatCount, uint8_t bpm, uint8_t beatPulse)
+{
     unsigned long now = millis();
 
     // ── Smooth LED fill update ────────────────────────────────────────────────
-    // Target: 1 LED per beat while gathering; jumps to full strip when stable BPM found.
-    const float riseSpeed = (float)NUM_LEDS * 10.0f / CONNECTING_FILL_MS;
+    const float riseSpeed = (float)HALF_LEDS * 10.0f / CONNECTING_FILL_MS;
     float targetLit = 0.0f;
-    if (animPhase == PHASE_GATHER) {
+    if (h.animPhase == PHASE_GATHER) {
         if (bpm > 0) {
-            targetLit = (float)NUM_LEDS;  // locks in for HOLD transition
+            targetLit = (float)HALF_LEDS;
         } else {
-            smoothLitLEDs = gatherFillLevel;  // pulse system owns movement; keep smoothLitLEDs in sync
-            targetLit     = gatherFillLevel;
+            h.smoothLitLEDs = h.gatherFillLevel;
+            targetLit       = h.gatherFillLevel;
         }
-    } else if (animPhase == PHASE_HOLD || animPhase == PHASE_PULSE) {
-        targetLit = (float)NUM_LEDS;
+    } else if (h.animPhase == PHASE_HOLD || h.animPhase == PHASE_PULSE) {
+        targetLit = (float)HALF_LEDS;
     }
-    if (smoothLitLEDs < targetLit) smoothLitLEDs = min(smoothLitLEDs + riseSpeed, targetLit);
-    else                           smoothLitLEDs = max(smoothLitLEDs - riseSpeed, targetLit);
+    if (h.smoothLitLEDs < targetLit) h.smoothLitLEDs = min(h.smoothLitLEDs + riseSpeed, targetLit);
+    else                              h.smoothLitLEDs = max(h.smoothLitLEDs - riseSpeed, targetLit);
 
-    // ── Beat detection — must happen before connectionLevel is computed ────────
-    // beatPulse spikes from ~0 to ~213 on each confirmed beat.
-    bool beatJustFired = (animPhase == PHASE_PULSE) && (beatPulse > 100) && (prevBeatPulse < 50);
-    prevBeatPulse = beatPulse;
+    // ── Beat detection ────────────────────────────────────────────────────────
+    bool beatJustFired = (h.animPhase == PHASE_PULSE) && (beatPulse > 100) && (h.prevBeatPulse < 50);
+    h.prevBeatPulse = beatPulse;
     if (beatJustFired && bpm > 0) {
-        animBeatMs = now;
+        h.animBeatMs = now;
         uint32_t target = 60000UL / (uint32_t)bpm;
-        animPeriodMs = (animPeriodMs * 4 + target) / 5; // 80/20 EMA — drifts, never jumps
+        h.animPeriodMs = (h.animPeriodMs * 4 + target) / 5;
     }
 
-    // ── GATHER: beat detection → spawn 3-LED traveling pulse ─────────────────
-    bool gatherBeatFired = (animPhase == PHASE_GATHER) && (bpm == 0) && (beatCount > prevBeatCount);
-    prevBeatCount = beatCount;
+    // ── GATHER: new beat → spawn 3-LED traveling pulse ────────────────────────
+    bool gatherBeatFired = (h.animPhase == PHASE_GATHER) && (bpm == 0) && (beatCount > h.prevBeatCount);
+    h.prevBeatCount = beatCount;
     if (gatherBeatFired) {
-        gatherFillLevel   = gatherPulseEnd;   // commit previous destination to solid fill
-        gatherPulsePos    = gatherFillLevel;
-        gatherPulseEnd    = min((float)NUM_LEDS,
-                                (float)beatCount / (float)GATHER_BEAT_TOTAL * (float)NUM_LEDS);
-        gatherPulseActive = true;
+        h.gatherFillLevel = h.gatherPulseEnd;
+        h.gatherPulsePos  = h.gatherFillLevel;
+        h.gatherPulseEnd  = min((float)HALF_LEDS,
+            (float)beatCount / (float)GATHER_BEAT_TOTAL * (float)HALF_LEDS);
+        h.gatherPulseActive = true;
     }
-    if (animPhase == PHASE_GATHER && gatherPulseActive) {
-        gatherPulsePos = min(gatherPulsePos + 0.5f, gatherPulseEnd);
-        if (gatherPulsePos >= gatherPulseEnd) {
-            gatherFillLevel   = gatherPulseEnd;
-            gatherPulseActive = false;
+    if (h.animPhase == PHASE_GATHER && h.gatherPulseActive) {
+        h.gatherPulsePos = min(h.gatherPulsePos + 0.5f, h.gatherPulseEnd);
+        if (h.gatherPulsePos >= h.gatherPulseEnd) {
+            h.gatherFillLevel   = h.gatherPulseEnd;
+            h.gatherPulseActive = false;
         }
     }
 
     // ── Connection level (PULSE only) ─────────────────────────────────────────
-    // 1.0 = beats on time, decays toward 0.0 as beats become overdue.
-    // Starts degrading after 1.5× expected interval, fully degraded at 4× interval.
-    // On a beat, animBeatMs resets → connectionLevel snaps back to 1.0 immediately.
-    uint32_t timeSinceLastBeat = (uint32_t)(now - animBeatMs);
-    uint32_t degradeStartMs    = animPeriodMs + animPeriodMs / 2; // 1.5×
-    uint32_t degradeFullMs     = animPeriodMs * 4;                // 4×
+    uint32_t timeSinceLastBeat = (uint32_t)(now - h.animBeatMs);
+    uint32_t degradeStartMs    = h.animPeriodMs + h.animPeriodMs / 2;
+    uint32_t degradeFullMs     = h.animPeriodMs * 4;
     float connectionLevel = 1.0f;
-    if (animPhase == PHASE_PULSE && timeSinceLastBeat > degradeStartMs) {
+    if (h.animPhase == PHASE_PULSE && timeSinceLastBeat > degradeStartMs) {
         connectionLevel = (timeSinceLastBeat >= degradeFullMs) ? 0.0f
             : 1.0f - (float)(timeSinceLastBeat - degradeStartMs)
                     / (float)(degradeFullMs - degradeStartMs);
     }
 
     // ── Phase transitions ─────────────────────────────────────────────────────
-    switch (animPhase) {
+    switch (h.animPhase) {
 
         case PHASE_IDLE:
             if (possibleContact || contact) {
-                bgLevel = (bgLevel > 1) ? bgLevel - 1 : 0;
+                h.bgLevel = (h.bgLevel > 1) ? h.bgLevel - 1 : 0;
             } else {
-                bgLevel = (bgLevel < 252) ? bgLevel + 5 : 255;
+                h.bgLevel = (h.bgLevel < 252) ? h.bgLevel + 5 : 255;
             }
             if (confirmed) {
-                animPhase         = PHASE_GATHER;
-                bgLevel           = 0;
-                smoothLitLEDs     = (float)GATHER_LEDS_PER_BEAT;
-                gatherFillLevel   = (float)GATHER_LEDS_PER_BEAT;
-                gatherPulsePos    = (float)GATHER_LEDS_PER_BEAT;
-                gatherPulseEnd    = (float)GATHER_LEDS_PER_BEAT;
-                gatherPulseActive = false;
-                prevBeatCount     = beatCount;
+                h.animPhase         = PHASE_GATHER;
+                h.bgLevel           = 0;
+                h.smoothLitLEDs     = (float)HALF_GATHER_INIT;
+                h.gatherFillLevel   = (float)HALF_GATHER_INIT;
+                h.gatherPulsePos    = (float)HALF_GATHER_INIT;
+                h.gatherPulseEnd    = (float)HALF_GATHER_INIT;
+                h.gatherPulseActive = false;
+                h.prevBeatCount     = beatCount;
             } else if (possibleContact) {
-                animPhase = PHASE_POSSIBLE;
+                h.animPhase = PHASE_POSSIBLE;
             }
             break;
 
         case PHASE_POSSIBLE:
-            if (bgLevel > 0) bgLevel = (bgLevel > 1) ? bgLevel - 1 : 0;
+            if (h.bgLevel > 0) h.bgLevel = (h.bgLevel > 1) ? h.bgLevel - 1 : 0;
             if (confirmed) {
-                animPhase         = PHASE_GATHER;
-                bgLevel           = 0;
-                smoothLitLEDs     = (float)GATHER_LEDS_PER_BEAT;
-                gatherFillLevel   = (float)GATHER_LEDS_PER_BEAT;
-                gatherPulsePos    = (float)GATHER_LEDS_PER_BEAT;
-                gatherPulseEnd    = (float)GATHER_LEDS_PER_BEAT;
-                gatherPulseActive = false;
-                prevBeatCount     = beatCount;
+                h.animPhase         = PHASE_GATHER;
+                h.bgLevel           = 0;
+                h.smoothLitLEDs     = (float)HALF_GATHER_INIT;
+                h.gatherFillLevel   = (float)HALF_GATHER_INIT;
+                h.gatherPulsePos    = (float)HALF_GATHER_INIT;
+                h.gatherPulseEnd    = (float)HALF_GATHER_INIT;
+                h.gatherPulseActive = false;
+                h.prevBeatCount     = beatCount;
             } else if (!possibleContact && !contact) {
-                animPhase = PHASE_IDLE;
+                h.animPhase = PHASE_IDLE;
             }
             break;
 
         case PHASE_GATHER:
             if (!confirmed && !contact && !possibleContact) {
-                animPhase = PHASE_IDLE;
-                bgLevel   = 0;
+                h.animPhase = PHASE_IDLE;
+                h.bgLevel   = 0;
             } else if (!confirmed && (contact || possibleContact)) {
-                animPhase = PHASE_POSSIBLE;
-                bgLevel   = 0;
-            } else if (bpm > 0 && smoothLitLEDs >= (float)NUM_LEDS - 0.5f) {
-                smoothLitLEDs    = (float)NUM_LEDS;
-                animPhase        = PHASE_HOLD;
-                animPhaseStartMs = now;
+                h.animPhase = PHASE_POSSIBLE;
+                h.bgLevel   = 0;
+            } else if (bpm > 0 && h.smoothLitLEDs >= (float)HALF_LEDS - 0.5f) {
+                h.smoothLitLEDs    = (float)HALF_LEDS;
+                h.animPhase        = PHASE_HOLD;
+                h.animPhaseStartMs = now;
             }
             break;
 
         case PHASE_HOLD:
             if (!confirmed) {
-                drainLitAtStart  = NUM_LEDS;
-                animPhase        = PHASE_DRAIN;
-                animPhaseStartMs = now;
-            } else if (now - animPhaseStartMs >= CONNECTING_HOLD_MS) {
-                animPhase  = PHASE_PULSE;
-                animBeatMs = now; // start at full brightness
+                h.drainLitAtStart  = HALF_LEDS;
+                h.animPhase        = PHASE_DRAIN;
+                h.animPhaseStartMs = now;
+            } else if (now - h.animPhaseStartMs >= CONNECTING_HOLD_MS) {
+                h.animPhase  = PHASE_PULSE;
+                h.animBeatMs = now;
             }
             break;
 
         case PHASE_PULSE:
             if (!confirmed) {
-                // Drain from wherever degradation left the strip — not always full.
-                drainLitAtStart  = max((uint16_t)1,
-                                       (uint16_t)(connectionLevel * NUM_LEDS + 0.5f));
-                animPhase        = PHASE_DRAIN;
-                animPhaseStartMs = now;
+                h.drainLitAtStart  = max((uint16_t)1,
+                                         (uint16_t)(connectionLevel * HALF_LEDS + 0.5f));
+                h.animPhase        = PHASE_DRAIN;
+                h.animPhaseStartMs = now;
             } else if (bpm == 0) {
-                // BPM history expired (8 s without a beat) — drop back to gather.
-                // smoothLitLEDs picks up from current degraded position (min 1) so
-                // the rebuild animation runs naturally from that point.
-                float resumeLevel = max((float)GATHER_LEDS_PER_BEAT,
-                                         connectionLevel * (float)NUM_LEDS);
-                smoothLitLEDs     = resumeLevel;
-                gatherFillLevel   = resumeLevel;
-                gatherPulsePos    = resumeLevel;
-                gatherPulseEnd    = resumeLevel;
-                gatherPulseActive = false;
-                prevBeatCount     = beatCount;
-                animPhase         = PHASE_GATHER;
+                float resumeLevel   = max((float)HALF_GATHER_INIT,
+                                           connectionLevel * (float)HALF_LEDS);
+                h.smoothLitLEDs     = resumeLevel;
+                h.gatherFillLevel   = resumeLevel;
+                h.gatherPulsePos    = resumeLevel;
+                h.gatherPulseEnd    = resumeLevel;
+                h.gatherPulseActive = false;
+                h.prevBeatCount     = beatCount;
+                h.animPhase         = PHASE_GATHER;
             }
             break;
 
         case PHASE_DRAIN:
             if (confirmed) {
-                animPhase  = PHASE_PULSE;
-                animBeatMs = now;
-            } else if (now - animPhaseStartMs >= DRAIN_MS) {
-                animPhase     = PHASE_IDLE;
-                bgLevel       = 0;
-                smoothLitLEDs = 0.0f;
-                prevBeatPulse = 0;
-            }
-            break;
-
-        case PHASE_SYNC:
-            if ((uint32_t)(now - syncStartMs) >= 27600) {
-                fill_solid(leds, NUM_LEDS, CRGB::Black);
-                animPhase     = PHASE_IDLE;
-                bgLevel       = 0;
-                smoothLitLEDs = 0.0f;
+                h.animPhase  = PHASE_PULSE;
+                h.animBeatMs = now;
+            } else if (now - h.animPhaseStartMs >= DRAIN_MS) {
+                h.animPhase     = PHASE_IDLE;
+                h.bgLevel       = 0;
+                h.smoothLitLEDs = 0.0f;
+                h.prevBeatPulse = 0;
             }
             break;
     }
 
     // ── Rendering ─────────────────────────────────────────────────────────────
-    switch (animPhase) {
+    switch (h.animPhase) {
 
         case PHASE_IDLE: {
-            // Low red scanner: 5-LED pulse bouncing back and forth, centre brightest.
-            uint8_t scanPos = beatsin8(30, 0, NUM_LEDS - 1);
-            fill_solid(leds, NUM_LEDS, CRGB::Black);
-            static const int8_t  off[5]   = { -2, -1,  0,  1,  2 };
-            static const uint8_t bri[5]   = {  12, 45, 110, 45, 12 };
+            // Both halves share the same beatsin8 value → scanners mirror each other,
+            // sweeping toward and away from the centre together.
+            uint8_t scanPos = beatsin8(30, 0, HALF_LEDS - 1);
+            fillHalf(rev, CRGB::Black);
+            static const int8_t  off[5] = { -2, -1,  0,  1,  2 };
+            static const uint8_t bri[5] = {  12, 45, 110, 45, 12 };
             for (uint8_t j = 0; j < 5; j++) {
                 int16_t idx = (int16_t)scanPos + off[j];
-                if (idx >= 0 && idx < (int16_t)NUM_LEDS)
-                    leds[idx] = CRGB(bri[j], 0, 0);
+                if (idx >= 0 && idx < HALF_LEDS) px(rev, idx) = CRGB(bri[j], 0, 0);
             }
             break;
         }
 
-        case PHASE_POSSIBLE: {
-            // Scanner lands: show first 3 LEDs steady so the user sees a clear "touch registered".
-            renderGatherLEDs(3);
+        case PHASE_POSSIBLE:
+            renderHalfGather(rev, 3);
             break;
-        }
 
         case PHASE_GATHER:
             if (bpm > 0) {
-                // BPM locked — smooth fill rising to full before HOLD.
-                renderGatherLEDs((uint16_t)smoothLitLEDs, false);
+                renderHalfGather(rev, (uint16_t)h.smoothLitLEDs, false);
             } else {
-                // Solid fill up to committed level.
-                renderGatherLEDs((uint16_t)gatherFillLevel, !gatherPulseActive);
-                // 3-LED traveling pulse: dim → mid → bright at head.
-                if (gatherPulseActive) {
-                    auto head = (int16_t)gatherPulsePos;
+                renderHalfGather(rev, (uint16_t)h.gatherFillLevel, !h.gatherPulseActive);
+                if (h.gatherPulseActive) {
+                    auto head = (int16_t)h.gatherPulsePos;
                     static const int8_t  poff[3] = { -2, -1,  0 };
                     static const uint8_t pbri[3] = { 80, 150, 230 };
                     for (uint8_t j = 0; j < 3; j++) {
                         int16_t idx = head + poff[j];
-                        if (idx >= 0 && idx < (int16_t)NUM_LEDS)
-                            leds[idx] = CRGB(pbri[j], 0, 0);
+                        if (idx >= 0 && idx < HALF_LEDS) px(rev, idx) = CRGB(pbri[j], 0, 0);
                     }
                 }
             }
             break;
 
         case PHASE_HOLD:
-            fill_solid(leds, NUM_LEDS, CRGB(200, 0, 0));
+            fillHalf(rev, CRGB(200, 0, 0));
             break;
 
         case PHASE_PULSE:
             if (connectionLevel < 1.0f) {
-                // Degraded: strip shrinks from right as beats become overdue.
-                // Floor at 1 LED — always shows the user something is still alive.
-                // A beat firing snaps connectionLevel back to 1.0 immediately.
                 uint16_t litCount = max((uint16_t)1,
-                                        (uint16_t)(connectionLevel * NUM_LEDS + 0.5f));
-                renderGatherLEDs(litCount);
+                                        (uint16_t)(connectionLevel * HALF_LEDS + 0.5f));
+                renderHalfGather(rev, litCount);
             } else {
-                // Full pulsing: quadratic decay from beat peak to ambient glow.
                 uint32_t elapsed   = timeSinceLastBeat;
-                if (elapsed > animPeriodMs) elapsed = animPeriodMs;
-                uint32_t remaining = animPeriodMs - elapsed;
-                uint8_t decay    = (uint8_t)((uint32_t)220 * remaining * remaining /
-                                              ((uint32_t)animPeriodMs * animPeriodMs));
-                uint8_t finalRed = qadd8(decay, 25);
-                fill_solid(leds, NUM_LEDS, CRGB(finalRed, 0, 0));
+                if (elapsed > h.animPeriodMs) elapsed = h.animPeriodMs;
+                uint32_t remaining = h.animPeriodMs - elapsed;
+                uint8_t  decay     = (uint8_t)((uint32_t)220 * remaining * remaining /
+                                               ((uint32_t)h.animPeriodMs * h.animPeriodMs));
+                uint8_t  finalRed  = qadd8(decay, 25);
+                fillHalf(rev, CRGB(finalRed, 0, 0));
             }
             break;
 
         case PHASE_DRAIN: {
-            // Right-to-left wipe starting from drainLitAtStart (may be < NUM_LEDS if degraded).
-            uint32_t elapsed = (uint32_t)(now - animPhaseStartMs);
+            uint32_t elapsed  = (uint32_t)(now - h.animPhaseStartMs);
             uint16_t litCount = (elapsed < DRAIN_MS)
-                ? (uint16_t)((uint32_t)drainLitAtStart * (DRAIN_MS - elapsed) / DRAIN_MS)
+                ? (uint16_t)((uint32_t)h.drainLitAtStart * (DRAIN_MS - elapsed) / DRAIN_MS)
                 : 0;
-            for (uint16_t i = 0; i < NUM_LEDS; i++) {
-                leds[i] = (i < litCount) ? CRGB(180, 0, 0) : CRGB::Black;
-            }
+            for (int i = 0; i < HALF_LEDS; i++)
+                px(rev, i) = ((uint16_t)i < litCount) ? CRGB(180, 0, 0) : CRGB::Black;
             break;
         }
-
-        case PHASE_SYNC:
-            renderSyncAnimation((uint32_t)(now - syncStartMs), bpm);
-            break;
     }
+}
+
+// ── Main frame function ───────────────────────────────────────────────────────
+
+void drawFrame(
+    bool possibleContactA, bool contactA, bool confirmedA, int beatCountA, uint8_t bpmA, uint8_t beatPulseA,
+    bool possibleContactB, bool contactB, bool confirmedB, int beatCountB, uint8_t bpmB, uint8_t beatPulseB)
+{
+    // SYNC is a full-strip override — bypasses per-half rendering.
+    if (syncActive) {
+        uint32_t elapsed = (uint32_t)(millis() - syncStartMs);
+        if (elapsed >= 27600) {
+            fill_solid(leds, NUM_LEDS, CRGB::Black);
+            syncActive        = false;
+            hA.animPhase      = PHASE_IDLE;
+            hB.animPhase      = PHASE_IDLE;
+            hA.bgLevel        = 0;
+            hB.bgLevel        = 0;
+            hA.smoothLitLEDs  = 0.0f;
+            hB.smoothLitLEDs  = 0.0f;
+        } else {
+            uint8_t bpm = (bpmA > 0) ? bpmA : bpmB;
+            renderSyncAnimation(elapsed, bpm);
+        }
+        return;
+    }
+
+    updateAndRenderHalf(hA, false,
+        possibleContactA, contactA, confirmedA, beatCountA, bpmA, beatPulseA);
+    updateAndRenderHalf(hB, true,
+        possibleContactB, contactB, confirmedB, beatCountB, bpmB, beatPulseB);
 }
 
 // ── Sync animation ─────────────────────────────────────────────────────────────
@@ -353,16 +374,14 @@ void drawFrame(bool possibleContact, bool contact, bool confirmed,
 static void renderSyncAnimation(uint32_t elapsed, uint8_t bpm) {
     const uint16_t midCount = max((uint16_t)3, (uint16_t)(NUM_LEDS / 6));
     const uint16_t midStart = (uint16_t)(NUM_LEDS / 2 - midCount / 2);
-    const uint16_t midEnd   = midStart + midCount;  // exclusive
+    const uint16_t midEnd   = midStart + midCount;
 
-    // ── 4 red pulses (0–3000 ms) ──────────────────────────────────────────────
     if (elapsed < 3000) {
         uint8_t phase = (uint8_t)((uint32_t)elapsed * 3 * 256 / 3000);
         fill_solid(leds, NUM_LEDS, CRGB(triwave8(phase), 0, 0));
 
-    // ── Smooth wipe from ends to centre (3000–4600 ms, 1600 ms = 20% faster) ─
     } else if (elapsed < 4600) {
-        uint32_t t        = elapsed - 3000;                             // 0–1600 ms
+        uint32_t t        = elapsed - 3000;
         uint16_t litCount = (uint16_t)(midCount +
                             (uint32_t)(NUM_LEDS - midCount) * (1600 - t) / 1600);
         uint16_t startIdx = (uint16_t)(NUM_LEDS / 2 - litCount / 2);
@@ -370,60 +389,43 @@ static void renderSyncAnimation(uint32_t elapsed, uint8_t bpm) {
         for (uint16_t i = startIdx; i < startIdx + litCount && i < NUM_LEDS; i++)
             leds[i] = CRGB(200, 0, 0);
 
-    // ── Centre colour shift: red → orange → yellow → magenta (4600–7600 ms) ──
     } else if (elapsed < 7600) {
         static const CRGB stops[4] = {
-            CRGB(220,   0,   0),   // red
-            CRGB(220,  90,   0),   // orange
-            CRGB(220, 180,   0),   // yellow
-            CRGB(200,   0, 180),   // magenta
+            CRGB(220,   0,   0),
+            CRGB(220,  90,   0),
+            CRGB(220, 180,   0),
+            CRGB(200,   0, 180),
         };
-        uint32_t t      = elapsed - 4600;                               // 0–3000 ms
+        uint32_t t      = elapsed - 4600;
         uint8_t  seg    = (uint8_t)(t / 1000); if (seg > 2) seg = 2;
         uint8_t  mixAmt = (uint8_t)((t - (uint32_t)seg * 1000) * 255 / 1000);
         CRGB     color  = blend(stops[seg], stops[seg + 1], mixAmt);
         fill_solid(leds, NUM_LEDS, CRGB::Black);
         for (uint16_t i = midStart; i < midEnd; i++) leds[i] = color;
 
-    // ── Electrical storm: frantic magenta sparks across full strip (7600–10600 ms)
-    // Each frame fades existing pixels and scatters new random sparks everywhere.
     } else if (elapsed < 10600) {
-        nscale8_video(leds, NUM_LEDS, 200);                             // fast fade (~200 ms trail)
+        nscale8_video(leds, NUM_LEDS, 200);
         uint8_t sparks = max((uint8_t)2, (uint8_t)(NUM_LEDS / 7));
-        for (uint8_t s = 0; s < sparks; s++) {
-            leds[random8(NUM_LEDS)] = CRGB(120, 0, 120);
-        }
+        for (uint8_t s = 0; s < sparks; s++) leds[random8(NUM_LEDS)] = CRGB(120, 0, 120);
 
-    // ── 10 electricity zaps: centre → both ends (10600–13600 ms) ─────────────
-    // Two 3-LED pulses launch from the strip centre simultaneously, travel to
-    // opposite ends, and repeat every 300 ms — same shape as the IDLE scanner.
     } else if (elapsed < 13600) {
         uint32_t t    = elapsed - 10600;
         uint32_t tZap = t % 300;
         float    prog = (float)tZap / 299.0f;
-
         fill_solid(leds, NUM_LEDS, CRGB::Black);
-
-        // Left pulse: head starts at midStart, travels to LED 0; trail is behind (higher index).
         int16_t lh = (int16_t)((float)midStart * (1.0f - prog));
         if (lh   >= 0 && lh   < (int16_t)NUM_LEDS) leds[lh  ] = CRGB(240, 0, 240);
         if (lh+1 >= 0 && lh+1 < (int16_t)NUM_LEDS) leds[lh+1] = CRGB(130, 0, 130);
         if (lh+2 >= 0 && lh+2 < (int16_t)NUM_LEDS) leds[lh+2] = CRGB( 55, 0,  55);
-
-        // Right pulse: head starts at midEnd-1, travels to last LED; trail is behind (lower index).
         int16_t rh = (int16_t)((float)(midEnd - 1) + (float)(NUM_LEDS - midEnd) * prog);
         if (rh   >= 0 && rh   < (int16_t)NUM_LEDS) leds[rh  ] = CRGB(240, 0, 240);
         if (rh-1 >= 0 && rh-1 < (int16_t)NUM_LEDS) leds[rh-1] = CRGB(130, 0, 130);
         if (rh-2 >= 0 && rh-2 < (int16_t)NUM_LEDS) leds[rh-2] = CRGB( 55, 0,  55);
 
-    // ── Fade up from black to full red (13600–14600 ms) ──────────────────────
     } else if (elapsed < 14600) {
         uint8_t bri = (uint8_t)((elapsed - 13600) * 220 / 1000);
         fill_solid(leds, NUM_LEDS, CRGB(bri, 0, 0));
 
-    // ── Full-strip BPM pulse (14600–19600 ms) ─────────────────────────────────
-    // Quadratic decay per heartbeat cycle, same shape as PHASE_PULSE.
-    // Falls back to 70 BPM if no stable reading is available.
     } else if (elapsed < 19600) {
         uint32_t period   = (bpm > 0) ? (60000UL / (uint32_t)bpm) : 857;
         uint32_t tInCycle = (elapsed - 14600) % period;
@@ -431,33 +433,36 @@ static void renderSyncAnimation(uint32_t elapsed, uint8_t bpm) {
         uint8_t  decay    = (uint8_t)((uint32_t)195 * rem * rem / ((uint32_t)period * period));
         fill_solid(leds, NUM_LEDS, CRGB(qadd8(decay, 25), 0, 0));
 
-    // ── Slow fade to black (19600–24600 ms) ───────────────────────────────────
     } else if (elapsed < 24600) {
         uint32_t t   = elapsed - 19600;
         uint8_t  bri = (t < 5000) ? (uint8_t)(220UL * (5000 - t) / 5000) : 0;
         fill_solid(leds, NUM_LEDS, CRGB(bri, 0, 0));
 
-    // ── Silence (24600–27600 ms) ───────────────────────────────────────────────
     } else {
         fill_solid(leds, NUM_LEDS, CRGB::Black);
     }
 }
 
 void triggerSyncAnimation() {
-    syncStartMs       = millis();
-    gatherPulseActive = false;
-    animPhase         = PHASE_SYNC;
+    syncStartMs          = millis();
+    syncActive           = true;
+    hA.gatherPulseActive = false;
+    hB.gatherPulseActive = false;
 }
 
 void cancelSyncAnimation() {
+    syncActive        = false;
     fill_solid(leds, NUM_LEDS, CRGB::Black);
     FastLED.show();
-    animPhase     = PHASE_IDLE;
-    bgLevel       = 0;
-    smoothLitLEDs = 0.0f;
+    hA.animPhase      = PHASE_IDLE;
+    hB.animPhase      = PHASE_IDLE;
+    hA.bgLevel        = 0;
+    hB.bgLevel        = 0;
+    hA.smoothLitLEDs  = 0.0f;
+    hB.smoothLitLEDs  = 0.0f;
 }
 
-bool isSyncAnimActive() { return animPhase == PHASE_SYNC; }
+bool isSyncAnimActive() { return syncActive; }
 
-void showLeds() { FastLED.show(); }
+void showLeds()  { FastLED.show(); }
 void clearLeds() { FastLED.clear(); }
